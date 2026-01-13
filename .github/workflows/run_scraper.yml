@@ -1,0 +1,33 @@
+name: Run Transfer Portal Scraper
+
+on:
+  workflow_dispatch:  # This creates a manual "Run" button
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # Allow running for up to 6 hours
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps
+
+      - name: Run Scraper
+        run: python scraper.py
+
+      - name: Upload CSV Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Transfer_Portal_Data
+          path: "*.csv"
