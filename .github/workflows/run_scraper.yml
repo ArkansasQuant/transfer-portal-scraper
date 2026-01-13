@@ -6,31 +6,31 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360  # 6 Hours allowed for 1,500+ players
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium
-          playwright install-deps
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        playwright install chromium
+        playwright install-deps
 
-      - name: Run Scraper
-        run: python debug.py
+    - name: Run Scraper
+      run: python scraper.py
 
-      - name: Upload Data and Debug Screenshots
-        uses: actions/upload-artifact@v4
-        if: always()  # Upload even if the script fails
-        with:
-          name: Scraper_Output
-          path: |
-            *.csv
-            *.png
+    - name: Upload Data
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: Scraper_Output
+        path: |
+          *.csv
+          failed_urls.csv
