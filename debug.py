@@ -16,7 +16,9 @@ async def analyze_profile(page, url):
     print(f"DIAGNOSING: {url}")
     
     try:
+        # Use 'commit' to load fast and ignore ads
         await page.goto(url, timeout=60000, wait_until="commit")
+        
         # Smart wait for name to ensure content loaded
         try: await page.wait_for_selector(".name", timeout=15000)
         except: pass
