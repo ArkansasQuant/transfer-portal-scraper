@@ -1,16 +1,17 @@
 import asyncio
 import random
-import time
 import pandas as pd
 import re
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime
+from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
 BASE_URL = "https://247sports.com/season/2026-football/transferportalpositionranking/"
+# We will use a broader "Wait" to ensure the list is actually there
 MAX_RETRIES = 3
-CONCURRENCY_LIMIT = 5  # Number of profiles to scrape at once (prevents throttling)
+CONCURRENCY_LIMIT = 5
 OUTPUT_FILE = f"transfer_portal_2026_{datetime.now().strftime('%Y%m%d')}.csv"
 
 # --- UTILS ---
@@ -19,30 +20,27 @@ def clean_text(text):
     return text.strip()
 
 def normalize_rank(rank):
-    if not rank or rank in ['-', '', 'N/A', None]:
-        return 'NA'
+    if not rank or rank in ['-', '', 'N/A', None]: return 'NA'
     return rank
 
 def extract_id_from_url(url):
-    # Extracts ID like 46108915 from url
     match = re.search(r'-(\d+)(?:/|$)', url)
     return match.group(1) if match else "NA"
 
 async def exponential_backoff(attempt):
-    wait_time = (2 ** attempt) + random.uniform(0, 1)
+    wait_time = (2 ** attempt) + random.uniform(1, 3)
     print(f"   Waiting {wait_time:.2f}s before retry...")
     await asyncio.sleep(wait_time)
 
-# --- PARSING LOGIC ---
+# --- PARSING LOGIC (Same as before) ---
 def parse_profile(html, url, player_id):
     soup = BeautifulSoup(html, 'lxml')
     data = {}
     
-    # 1. Basic Info & Prospect Info
+    # 1. Basic Info
     data['247 ID'] = player_id
     data['Player Name'] = clean_text(soup.select_one('.name').text) if soup.select_one('.name') else "NA"
     
-    # Metrics (Height, Weight, POS)
     metrics = soup.select('.metrics-list li')
     data['Position'] = "NA"
     data['Height'] = "NA"
@@ -54,10 +52,9 @@ def parse_profile(html, url, player_id):
         elif 'Height' in text: data['Height'] = text.replace('Height', '').strip()
         elif 'Weight' in text: data['Weight'] = text.replace('Weight', '').strip()
 
-    # Hometown / HS / Team
     data['High School'] = "NA"
     data['City, ST'] = "NA"
-    data['Team'] = "NA" # Current Team
+    data['Team'] = "NA"
     data['EXP'] = "NA"
 
     details = soup.select('.details li')
@@ -67,33 +64,24 @@ def parse_profile(html, url, player_id):
         elif 'Home Town' in text: data['City, ST'] = text.replace('Home Town', '').strip()
         elif 'Class' in text: data['EXP'] = text.replace('Class', '').strip()
     
-    # Sometimes Team is in a different header spot
     team_tag = soup.select_one('.ni-school-name a')
-    if team_tag:
-        data['Team'] = team_tag.text.strip()
+    if team_tag: data['Team'] = team_tag.text.strip()
 
-    # --- SECTION 2: AS A TRANSFER ---
-    # We look for the "Transfer" header section
+    # 2. Transfer
     data['Transfer Stars'] = "0"
     data['Transfer Rating'] = "NA"
     data['Transfer Year'] = "2026"
     data['Transfer Overall Rank'] = "NA"
     data['Transfer Position Rank'] = "NA"
-    data['Transfer Team Name'] = "NA" # The team they transferred TO
+    data['Transfer Team Name'] = "NA"
 
-    # Locate Transfer Section
     transfer_sect = soup.select_one('.transfer-rankings')
     if transfer_sect:
-        # Stars (count gold stars)
         stars = transfer_sect.select('.icon-starsolid.yellow')
         data['Transfer Stars'] = len(stars)
-        
-        # Rating
         rating = transfer_sect.select_one('.rating')
         if rating: data['Transfer Rating'] = rating.text.strip()
         
-        # Ranks
-        # We need to find the specific <li> that matches the player's position
         rank_items = transfer_sect.select('.ranks-list li')
         for item in rank_items:
             header = item.select_one('h5')
@@ -102,39 +90,25 @@ def parse_profile(html, url, player_id):
             value = item.select_one('strong')
             if not value: continue
             
-            if 'OVR' in header_text:
-                data['Transfer Overall Rank'] = normalize_rank(value.text.strip())
-            # Check if header matches player position (e.g. "QB" == "QB")
-            elif data['Position'] in header_text:
-                data['Transfer Position Rank'] = normalize_rank(value.text.strip())
+            if 'OVR' in header_text: data['Transfer Overall Rank'] = normalize_rank(value.text.strip())
+            elif data['Position'] in header_text: data['Transfer Position Rank'] = normalize_rank(value.text.strip())
 
-    # Committed Team (often at top of page or in transfer section)
-    # 247 usually shows the destination team logo/text in the header if committed
     commit_node = soup.select_one('.transfer-prediction .team-name') 
-    if commit_node:
-        data['Transfer Team Name'] = commit_node.text.strip()
+    if commit_node: data['Transfer Team Name'] = commit_node.text.strip()
 
-    # --- SECTION 3: AS A PROSPECT ---
+    # 3. Prospect
     data['Prospect Stars'] = "0"
     data['Prospect Rating'] = "NA"
     data['Prospect Position Rank'] = "NA"
     data['Prospect National Rank'] = "NA"
     
-    # Check for JUCO
     is_juco = False
-    prospect_sect = soup.select_one('.prospect-rankings') # Standard HS
-    
-    # If standard prospect section missing, look for JUCO specific indicators
-    # Note: 247 often keeps the class name same but changes header text
+    prospect_sect = soup.select_one('.prospect-rankings')
     
     if prospect_sect:
-        # Check JUCO flag in stars or headers
-        if "JUCO" in prospect_sect.text or soup.select_one('.icon-juco'):
-            is_juco = True
-            
+        if "JUCO" in prospect_sect.text or soup.select_one('.icon-juco'): is_juco = True   
         stars = prospect_sect.select('.icon-starsolid.yellow')
         data['Prospect Stars'] = "JUCO" if is_juco and len(stars) == 0 else len(stars)
-        
         rating = prospect_sect.select_one('.rating')
         if rating: data['Prospect Rating'] = rating.text.strip()
         
@@ -146,89 +120,110 @@ def parse_profile(html, url, player_id):
             value = item.select_one('strong')
             if not value: continue
             
-            if 'Natl' in header_text or 'National' in header_text:
-                data['Prospect National Rank'] = normalize_rank(value.text.strip())
-            elif data['Position'] in header_text:
-                data['Prospect Position Rank'] = normalize_rank(value.text.strip())
-
-    if is_juco and data['Prospect National Rank'] == "NA":
-         # If purely JUCO and no rank found, ensure logic follows request
-         pass 
+            if 'Natl' in header_text or 'National' in header_text: data['Prospect National Rank'] = normalize_rank(value.text.strip())
+            elif data['Position'] in header_text: data['Prospect Position Rank'] = normalize_rank(value.text.strip())
 
     return data
 
 async def scrape_profile(context, url, sem, failed_urls):
-    async with sem: # Limit concurrency
+    async with sem:
         for attempt in range(MAX_RETRIES):
             page = await context.new_page()
             try:
-                # Random delay to be polite
-                await asyncio.sleep(random.uniform(0.5, 2.0))
+                # Slower, more human-like pause
+                await asyncio.sleep(random.uniform(1.0, 3.0))
                 
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 if response.status != 200:
-                    raise Exception(f"Status {response.status}")
+                    # Sometimes 403 means blocked, but sometimes we can still scrape content
+                    print(f"   [WARN] Status {response.status} for {url}")
                 
                 content = await page.content()
-                player_id = extract_id_from_url(url)
                 
-                # Parse
+                # Validation: Did we actually get a profile?
+                if "Player Profile" not in content and "name" not in content:
+                    raise Exception("Profile content missing (Blocked?)")
+
+                player_id = extract_id_from_url(url)
                 data = parse_profile(content, url, player_id)
-                data['URL'] = url # Keep record
+                data['URL'] = url
                 
                 await page.close()
                 print(f"   [SUCCESS] {data['Player Name']}")
                 return data
 
             except Exception as e:
-                print(f"   [ERROR] {url} (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
+                print(f"   [ERROR] {url}: {e}")
                 await page.close()
                 if attempt < MAX_RETRIES - 1:
                     await exponential_backoff(attempt)
                 else:
-                    failed_urls.append({'url': url, 'reason': str(e), 'time': datetime.now().isoformat()})
+                    failed_urls.append({'url': url, 'reason': str(e)})
                     return None
 
 async def main():
+    ua = UserAgent()
+    user_agent_str = ua.random
+    print(f"--- Using Identity: {user_agent_str} ---")
+
     async with async_playwright() as p:
-        # Browser setup
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            user_agent=user_agent_str,
+            viewport={'width': 1920, 'height': 1080}
         )
         
         page = await context.new_page()
         print(f"--- 1. Loading Main List: {BASE_URL} ---")
-        await page.goto(BASE_URL, timeout=120000)
         
+        try:
+            await page.goto(BASE_URL, timeout=60000, wait_until="domcontentloaded")
+            # Take a screenshot to debug if it fails
+            await page.screenshot(path="debug_landing_page.png")
+        except Exception as e:
+            print(f"CRITICAL: Could not load main page. {e}")
+            await page.screenshot(path="debug_failure.png")
+            await browser.close()
+            return
+
         # --- CLICK "LOAD MORE" LOOP ---
-        while True:
+        # We will try up to 50 clicks (approx 2500 players capacity)
+        for i in range(50):
             try:
-                # Selector for the "Load More" button
-                load_more = page.locator(".showmore_lnk") 
-                if await load_more.is_visible():
-                    print("   Clicking 'Load More Players'...")
-                    await load_more.click()
-                    # Wait for new content to load (waiting for spinner to go away or list to grow)
-                    await page.wait_for_timeout(2000) 
+                # Look for button by TEXT or Class (more robust)
+                load_more = page.locator("a.showmore_lnk, text='Load More'")
+                
+                if await load_more.count() > 0 and await load_more.first.is_visible():
+                    print(f"   [Click {i+1}] Loading more players...")
+                    await load_more.first.click()
+                    # Wait for network idle or simple timeout
+                    await page.wait_for_timeout(random.randint(1500, 3000))
                 else:
-                    print("   End of list reached (or no button found).")
+                    print("   No more 'Load More' buttons found.")
                     break
             except Exception as e:
                 print(f"   Load More loop interrupted: {e}")
                 break
         
-        # --- COLLECT LINKS ---
+        # --- COLLECT LINKS (BROADER SELECTOR) ---
         print("--- 2. Extracting Player Links ---")
-        # 247 links are usually in .rankings-page__name-link
+        
+        # This selector grabs ANY link that has "/player/" in the URL. 
+        # This fixes the issue if they changed the class name.
         links = await page.eval_on_selector_all(
-            "a.rankings-page__name-link", 
+            "a[href*='/player/']", 
             "elements => elements.map(e => e.href)"
         )
-        # Deduplicate
-        links = list(set(links))
+        
+        # Filter duplicates and ensure they are 247 links
+        links = list(set([l for l in links if "247sports.com/player/" in l]))
         print(f"   Found {len(links)} unique player profiles.")
         
+        if len(links) == 0:
+            print("!!! ERROR: Found 0 links. The page might be blocked. Check 'debug_landing_page.png' artifact !!!")
+            await browser.close()
+            return
+
         await page.close()
 
         # --- SCRAPE PROFILES ---
@@ -236,22 +231,17 @@ async def main():
         sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
         failed_urls = []
         tasks = [scrape_profile(context, link, sem, failed_urls) for link in links]
-        
         results = await asyncio.gather(*tasks)
         
-        # Filter None results
         valid_results = [r for r in results if r]
         
-        # --- SAVE ---
         df = pd.DataFrame(valid_results)
         
-        # Ensure column order matches request
         cols = [
             "247 ID", "Player Name", "Position", "Height", "Weight", "High School", "City, ST", "EXP", "Team",
             "Transfer Stars", "Transfer Rating", "Transfer Year", "Transfer Overall Rank", "Transfer Position Rank", "Transfer Team Name",
             "Prospect Stars", "Prospect Rating", "Prospect Position Rank", "Prospect National Rank"
         ]
-        # Reindex checks if cols exist, fills missing with NaN
         df = df.reindex(columns=cols)
         
         df.to_csv(OUTPUT_FILE, index=False)
@@ -259,7 +249,6 @@ async def main():
         
         if failed_urls:
             pd.DataFrame(failed_urls).to_csv("failed_urls.csv", index=False)
-            print(f"   WARNING: {len(failed_urls)} pages failed. See failed_urls.csv")
 
         await browser.close()
 
