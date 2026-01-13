@@ -31,22 +31,15 @@ async def exponential_backoff(attempt):
     print(f"   Waiting {wait_time:.2f}s before retry...")
     await asyncio.sleep(wait_time)
 
-# --- SMART PARSER (Looks for text labels, not just classes) ---
+# --- SMART PARSER ---
 def find_value_by_label(soup, label_patterns, parent_tag='li'):
-    """Finds a label (like 'High School') and returns the text next to it."""
-    # Try finding the specific text
     for pattern in label_patterns:
-        # Search for elements containing the label text
         elements = soup.find_all(string=re.compile(pattern, re.IGNORECASE))
         for el in elements:
-            # Usually the value is in the parent <li> or a sibling <span>
             parent = el.find_parent(parent_tag)
             if parent:
-                # Remove the label text to get the value
                 text = parent.get_text(" ", strip=True)
-                # Remove the label itself from the text (case insensitive)
                 clean_val = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
-                # Remove trailing/leading colons or punctuation
                 clean_val = clean_val.strip(":").strip()
                 if clean_val: return clean_val
     return "NA"
@@ -55,56 +48,44 @@ def parse_profile(html, url, player_id):
     soup = BeautifulSoup(html, 'lxml')
     data = {}
     
-    # 1. Basic Info
     data['247 ID'] = player_id
-    
-    # Name is usually in a simpler header
     name_tag = soup.select_one('.name') or soup.select_one('h1.name')
     data['Player Name'] = clean_text(name_tag.text) if name_tag else "NA"
     
-    # Metrics - Try both class method and fuzzy find method
     metrics_list = soup.select('.metrics-list li')
     data['Position'] = "NA"
     data['Height'] = "NA"
     data['Weight'] = "NA"
     
-    # Strategy: Parse the metrics strip at top
     if metrics_list:
         for m in metrics_list:
             text = m.text.strip()
             if 'Pos' in text: data['Position'] = text.replace('Pos', '').strip()
             elif 'Height' in text: 
-                # Add ' to force Excel text format
                 raw_ht = text.replace('Height', '').strip()
                 data['Height'] = f"'{raw_ht}" 
             elif 'Weight' in text: data['Weight'] = text.replace('Weight', '').strip()
 
-    # Smart Search for Details
-    # We look for "High School", "Home Town", "Class" anywhere in the list
     data['High School'] = find_value_by_label(soup, ["High School"])
     data['City, ST'] = find_value_by_label(soup, ["Home Town", "Hometown"])
     data['EXP'] = find_value_by_label(soup, ["Class", "Exp"])
     
-    # Team - often complex. Look for 'Committed' or 'Enrolled' blocks
     data['Team'] = "NA"
-    team_tag = soup.select_one('.ni-school-name a') # Standard
+    team_tag = soup.select_one('.ni-school-name a')
     if team_tag: 
         data['Team'] = team_tag.text.strip()
     else:
-        # Fallback: Look for "Committed to" text
         commit_node = soup.select_one('.transfer-prediction .team-name')
         if commit_node: data['Team'] = commit_node.text.strip()
 
-    # --- SECTION 2: AS A TRANSFER ---
-    # We define specific search logic for the Transfer Section
+    # Transfer Section
     data['Transfer Stars'] = "0"
     data['Transfer Rating'] = "NA"
     data['Transfer Year'] = "2026"
     data['Transfer Overall Rank'] = "NA"
     data['Transfer Position Rank'] = "NA"
-    data['Transfer Team Name'] = data['Team'] # Often same
+    data['Transfer Team Name'] = data['Team']
 
-    # Locate Transfer Section by finding the header "Transfer"
     transfer_sect = None
     for sect in soup.select('section'):
         if 'Transfer' in sect.get_text() and 'Rankings' in sect.get_text():
@@ -112,31 +93,22 @@ def parse_profile(html, url, player_id):
             break
             
     if transfer_sect:
-        # Stars
         stars = transfer_sect.select('.icon-starsolid.yellow')
         data['Transfer Stars'] = len(stars)
-        
-        # Rating
         rating = transfer_sect.select_one('.rating')
         if rating: data['Transfer Rating'] = rating.text.strip()
-        
-        # Ranks - Look for OVR and Pos inside this section
         data['Transfer Overall Rank'] = find_value_by_label(transfer_sect, ["OVR", "Natl", "National"])
-        
-        # Position rank is tricky, it matches the player position
         pos_rank = find_value_by_label(transfer_sect, [data['Position']])
-        # If the fuzzy finder just found the position name itself (e.g. "QB"), ignore it
         if pos_rank != data['Position']:
             data['Transfer Position Rank'] = normalize_rank(pos_rank)
 
-    # --- SECTION 3: AS A PROSPECT ---
+    # Prospect Section
     data['Prospect Stars'] = "0"
     data['Prospect Rating'] = "NA"
     data['Prospect Position Rank'] = "NA"
     data['Prospect National Rank'] = "NA"
     
     prospect_sect = None
-    # Look for "Prospect" or "High School" section
     for sect in soup.select('section'):
         header = sect.select_one('h2, h3, h4')
         if header and ('Prospect' in header.text or 'High School' in header.text):
@@ -146,18 +118,10 @@ def parse_profile(html, url, player_id):
     if prospect_sect:
         is_juco = "JUCO" in prospect_sect.get_text()
         stars = prospect_sect.select('.icon-starsolid.yellow')
-        
-        if is_juco and len(stars) == 0:
-            data['Prospect Stars'] = "JUCO"
-        else:
-            data['Prospect Stars'] = len(stars)
-
+        data['Prospect Stars'] = "JUCO" if is_juco and len(stars) == 0 else len(stars)
         rating = prospect_sect.select_one('.rating')
         if rating: data['Prospect Rating'] = rating.text.strip()
-        
         data['Prospect National Rank'] = find_value_by_label(prospect_sect, ["Natl", "National"])
-        
-        # Position Rank
         pos_rank = find_value_by_label(prospect_sect, [data['Position'], "Pos"])
         if pos_rank != data['Position']:
             data['Prospect Position Rank'] = normalize_rank(pos_rank)
@@ -168,9 +132,12 @@ async def scrape_profile(context, url, sem, failed_urls):
     async with sem:
         for attempt in range(MAX_RETRIES):
             page = await context.new_page()
+            # BLOCK ADS/IMAGES for speed
+            await page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2}", lambda route: route.abort())
             try:
                 await asyncio.sleep(random.uniform(0.5, 1.5))
-                response = await page.goto(url, timeout=60000)
+                # Faster wait setting
+                response = await page.goto(url, timeout=45000, wait_until="domcontentloaded")
                 
                 content = await page.content()
                 if "Player Profile" not in content and "name" not in content:
@@ -195,30 +162,45 @@ async def scrape_profile(context, url, sem, failed_urls):
 
 async def main():
     ua = UserAgent()
+    print("--- Starting Scraper with Fast-Load Settings ---")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent=ua.random, viewport={'width': 1920, 'height': 1080})
-        page = await context.new_page()
         
-        print(f"--- 1. Loading Main List: {BASE_URL} ---")
-        await page.goto(BASE_URL, timeout=90000)
+        # --- 1. Load Main List (With Retry) ---
+        page = await context.new_page()
+        # Block heavy media on main list too
+        await page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2}", lambda route: route.abort())
+
+        list_loaded = False
+        for i in range(3):
+            try:
+                print(f"--- Attempt {i+1} to load Main List ---")
+                # wait_until='domcontentloaded' is much faster than 'load'
+                await page.goto(BASE_URL, timeout=60000, wait_until="domcontentloaded")
+                list_loaded = True
+                break
+            except Exception as e:
+                print(f"   Main list load failed: {e}. Retrying...")
+                await asyncio.sleep(5)
+        
+        if not list_loaded:
+            print("CRITICAL: Failed to load main list 3 times. Exiting.")
+            await browser.close()
+            return
 
         # --- FORCE LOAD MORE ---
-        # We try 100 times. We also SCROLL to the bottom to trigger the button visibility.
         for i in range(100):
             try:
-                # 1. Scroll to bottom
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1) 
+                await asyncio.sleep(1)
                 
-                # 2. Check for button
                 load_more = page.locator(".showmore_lnk")
                 if await load_more.count() > 0 and await load_more.first.is_visible():
-                    print(f"   [Click {i+1}] Clicking Load More...")
-                    # Force Click using JS (More reliable than mouse click)
+                    print(f"   [Click {i+1}] Loading more...")
                     await page.evaluate("document.querySelector('.showmore_lnk').click()")
-                    # Wait for data to load
-                    await page.wait_for_timeout(random.randint(2000, 4000))
+                    # Reduced wait time since we are blocking images
+                    await page.wait_for_timeout(random.randint(1500, 2500))
                 else:
                     print("   No more buttons found.")
                     break
@@ -231,7 +213,6 @@ async def main():
         links = await page.eval_on_selector_all("a[href*='/player/']", "elements => elements.map(e => e.href)")
         links = list(set([l for l in links if "247sports.com/player/" in l]))
         print(f"   Found {len(links)} profiles.")
-
         await page.close()
 
         # --- SCRAPE ---
