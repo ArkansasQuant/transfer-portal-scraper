@@ -13,10 +13,19 @@ CONCURRENCY_LIMIT = 4
 MAX_RETRIES = 5
 OUTPUT_FILE = f"transfer_portal_2026_FINAL_{datetime.now().strftime('%Y%m%d')}.csv"
 
+# Valid Football Positions (Whitelisted to ignore State Ranks like KS, FL, TX)
+VALID_POSITIONS = {
+    'QB', 'RB', 'WR', 'TE', 'OT', 'IOL', 'OC', 'DL', 'EDGE', 
+    'LB', 'CB', 'S', 'ATH', 'K', 'P', 'LS', 'RET'
+}
+
 # --- UTILS ---
 def clean_text(text):
     if not text: return None
-    return text.strip()
+    # normalize N/A, -, empty strings to "NA"
+    t = text.strip()
+    if t in ["N/A", "", "-"]: return "NA"
+    return t
 
 def extract_id_from_url(url):
     match = re.search(r'-(\d+)(?:/|$)', url)
@@ -47,6 +56,7 @@ def parse_profile(html, url, player_id):
     all_header_items = soup.select('.metrics-list li') + soup.select('.details li')
     for item in all_header_items:
         text = item.get_text(strip=True)
+        # Use regex to find Label:Value patterns
         if 'Pos' in text or 'Position' in text:
             match = re.search(r'(?:Pos|Position)[:\s]*(.*)', text, re.IGNORECASE)
             if match: data['Position'] = match.group(1).strip()
@@ -83,7 +93,7 @@ def parse_profile(html, url, player_id):
     transfer_node = soup.find(string=re.compile("As a Transfer"))
     prospect_node = soup.find(string=re.compile("As a Prospect"))
 
-    # --- PARSE TRANSFER ("As a Transfer") ---
+    # --- PARSE TRANSFER ---
     data['Transfer Stars'] = "0"
     data['Transfer Rating'] = "NA"
     data['Transfer Year'] = "2026"
@@ -93,31 +103,26 @@ def parse_profile(html, url, player_id):
     if transfer_node:
         t_container = transfer_node.find_parent('section') or transfer_node.find_parent('div')
         if t_container:
-            # Stars (Strictly inside this container)
             stars = t_container.select('.icon-starsolid.yellow')
             data['Transfer Stars'] = len(stars)
             
-            # Rating
             rating = t_container.select_one('.rating')
-            if rating: 
-                data['Transfer Rating'] = rating.text.strip()
-            else:
-                # Backup regex for rating
-                txt = t_container.get_text()
-                match = re.search(r'\b(7\d|8\d|9\d)\b', txt)
-                if match: data['Transfer Rating'] = match.group(1)
+            if rating: data['Transfer Rating'] = clean_text(rating.text)
             
-            # Ranks
+            # Ranks (Whitelist Logic)
             for li in t_container.select('li'):
-                text = li.get_text(" ", strip=True).upper()
-                if 'OVR' in text:
-                    match = re.search(r'(\d+)', text)
-                    if match: data['Transfer Overall Rank'] = match.group(1)
-                elif data['Position'] and data['Position'].upper() in text.split():
-                    match = re.search(r'(\d+)', text)
-                    if match: data['Transfer Position Rank'] = match.group(1)
+                label_tag = li.select_one('h5')
+                val_tag = li.select_one('strong')
+                if label_tag and val_tag:
+                    label = label_tag.get_text(strip=True).upper()
+                    val = clean_text(val_tag.get_text(strip=True))
+                    
+                    if 'OVR' in label:
+                        data['Transfer Overall Rank'] = val
+                    elif label in VALID_POSITIONS:
+                        data['Transfer Position Rank'] = val
 
-    # --- PARSE PROSPECT ("As a Prospect") ---
+    # --- PARSE PROSPECT ---
     data['Prospect Stars'] = "0"
     data['Prospect Rating'] = "NA"
     data['Prospect Position Rank'] = "NA"
@@ -131,31 +136,38 @@ def parse_profile(html, url, player_id):
             
             # Stars
             stars = p_container.select('.icon-starsolid.yellow')
-            data['Prospect Stars'] = len(stars)
+            if is_juco and len(stars) == 0:
+                data['Prospect Stars'] = "0 JUCO"
+            else:
+                data['Prospect Stars'] = len(stars)
+                if is_juco: data['Prospect Stars'] = f"{len(stars)} JUCO"
             
-            # JUCO Handling for National Rank
-            if is_juco:
-                data['Prospect National Rank'] = "JUCO"
-                
             # Rating
             rating = p_container.select_one('.rating')
-            if rating: 
-                r_text = rating.text.strip()
-                data['Prospect Rating'] = r_text if r_text != 'N/A' else 'NA'
-            
-            # Ranks
-            for li in p_container.select('li'):
-                text = li.get_text(" ", strip=True).upper()
-                if "N/A" in text: continue
+            if rating:
+                val = clean_text(rating.text)
+                data['Prospect Rating'] = f"{val} JUCO" if (is_juco and val != "NA") else val
+            elif is_juco:
+                 data['Prospect Rating'] = "NA JUCO"
 
-                if 'NATL' in text or 'NATIONAL' in text:
-                    # If we find a real number, we can overwrite "JUCO" or keep it.
-                    # Usually standard prospects have this. JUCOs rarely do.
-                    match = re.search(r'(\d+)', text)
-                    if match: data['Prospect National Rank'] = match.group(1)
-                elif data['Position'] and data['Position'].upper() in text.split():
-                    match = re.search(r'(\d+)', text)
-                    if match: data['Prospect Position Rank'] = match.group(1)
+            # Ranks (Prioritize NATL, then Whitelist)
+            found_natl = False
+            for li in p_container.select('li'):
+                label_tag = li.select_one('h5')
+                val_tag = li.select_one('strong')
+                if label_tag and val_tag:
+                    label = label_tag.get_text(strip=True).upper()
+                    val = clean_text(val_tag.get_text(strip=True))
+                    
+                    if 'NATL' in label or 'NATIONAL' in label:
+                        data['Prospect National Rank'] = f"{val} JUCO" if is_juco else val
+                        found_natl = True
+                    elif label in VALID_POSITIONS:
+                        data['Prospect Position Rank'] = f"{val} JUCO" if is_juco else val
+
+            # JUCO Fallback for National Rank
+            if is_juco and not found_natl:
+                data['Prospect National Rank'] = "JUCO"
 
     return data
 
@@ -193,7 +205,7 @@ async def scrape_profile(context, url, sem, failed_urls):
 
 async def main():
     ua = UserAgent()
-    print("--- Starting DIAMOND Scraper (JUCO Fixed) ---")
+    print("--- Starting FINAL Scraper (Position Whitelist Logic) ---")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
