@@ -9,7 +9,7 @@ from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
 BASE_URL = "https://247sports.com/season/2026-football/transferportalpositionranking/"
-CONCURRENCY_LIMIT = 4
+CONCURRENCY_LIMIT = 5  # Restoring higher speed
 MAX_RETRIES = 5
 OUTPUT_FILE = f"transfer_portal_2026_FINAL_{datetime.now().strftime('%Y%m%d')}.csv"
 
@@ -17,22 +17,21 @@ OUTPUT_FILE = f"transfer_portal_2026_FINAL_{datetime.now().strftime('%Y%m%d')}.c
 def clean_text(text):
     if not text: return "NA"
     t = text.strip()
-    if t in ["N/A", "", "-"]: return "NA"
-    return t
+    return "NA" if t in ["N/A", "", "-"] else t
 
 def extract_id_from_url(url):
     match = re.search(r'-(\d+)(?:/|$)', url)
     return match.group(1) if match else "NA"
 
 async def random_delay():
-    await asyncio.sleep(random.uniform(1.0, 2.0))
+    await asyncio.sleep(random.uniform(1.0, 1.5))
 
-# --- PARSING LOGIC (ROBUST VERSION) ---
+# --- PARSING LOGIC ---
 def parse_profile(html, url, player_id):
     soup = BeautifulSoup(html, 'lxml')
     data = {}
     
-    # 1. HEADER INFO
+    # 1. HEADER INFO (The reliable part)
     data['247 ID'] = player_id
     name_tag = soup.select_one('.name') or soup.select_one('h1.name')
     data['Player Name'] = clean_text(name_tag.text) if name_tag else "NA"
@@ -45,7 +44,7 @@ def parse_profile(html, url, player_id):
     data['City, ST'] = "NA"
     data['EXP'] = "NA"
     
-    # Parse Header Metrics
+    # Header Parsing
     all_header_items = soup.select('.metrics-list li') + soup.select('.details li')
     for item in all_header_items:
         text = item.get_text(strip=True)
@@ -68,114 +67,109 @@ def parse_profile(html, url, player_id):
             match = re.search(r'(?:Class|Exp)[:\s]*(.*)', text, re.IGNORECASE)
             if match: data['EXP'] = match.group(1).strip()
 
-    # 2. TEAM PARSING
+    # --- TEAM LOGIC (Banner Priority) ---
     data['Team'] = "NA"
+    logo = soup.select_one('.primary-team-logo')
+    if logo and logo.get('alt'):
+        data['Team'] = logo.get('alt')
+    elif soup.select_one('.ni-school-name a'):
+        data['Team'] = soup.select_one('.ni-school-name a').text.strip()
+
     data['Transfer Team Name'] = "NA"
+    banner = soup.select_one('.qa-team-name')
+    if banner:
+        data['Transfer Team Name'] = banner.text.strip()
     
-    # Destination (Transfer Team)
-    commit_banner = soup.select_one('.commitment-banner .team-name') or \
-                    soup.select_one('.header-commitment .team-name') or \
-                    soup.select_one('.main-team-logo.is-committed')
-    if commit_banner: 
-        data['Transfer Team Name'] = clean_text(commit_banner.get_text(strip=True))
+    # --- RANKINGS SECTION IDENTIFICATION ---
+    # We find the *Text Node* specifically to get the right box.
+    # This is the "Broadnet" approach that worked well.
+    transfer_node = soup.find(string=re.compile("As a Transfer"))
+    prospect_node = soup.find(string=re.compile("As a Prospect"))
 
-    # Origin Team (Current/Former)
-    origin_node = soup.select_one('.crystal-ball .team-name') or \
-                  soup.select_one('.prediction-box .team-name') or \
-                  soup.select_one('.module-team-logo .team-name')
-    
-    if origin_node:
-        data['Team'] = clean_text(origin_node.get_text(strip=True))
-    else:
-        # Fallback to primary logo if it's different from destination
-        primary = soup.select_one('.primary-team-logo')
-        if primary and primary.get('alt'):
-            cand = clean_text(primary.get('alt'))
-            if cand != data['Transfer Team Name']:
-                data['Team'] = cand
+    # --- PARSE TRANSFER ("As a Transfer") ---
+    data['Transfer Stars'] = "0"
+    data['Transfer Rating'] = "NA"
+    data['Transfer Year'] = "2026"
+    data['Transfer Overall Rank'] = "NA"
+    data['Transfer Position Rank'] = "NA"
 
-    # 3. SECTION PARSING (The "Scan All Lists" Fix)
-    all_uls = soup.find_all('ul')
-    
-    transfer_ul = None
-    prospect_ul = None
-
-    # Identify sections by their content keywords
-    for ul in all_uls:
-        text = ul.get_text(" ", strip=True)
-        if "Transfer Rating" in text:
-            transfer_ul = ul
-        elif ("Natl" in text or "National" in text) and "Transfer" not in text:
-            prospect_ul = ul
-        elif "Pos" in text and "Transfer" not in text and prospect_ul is None:
-            # Fallback for Prospect if no National rank but has Position rank
-            if ul.find_previous(class_='icon-starsolid'):
-                prospect_ul = ul
-
-    # Helper function to extract data from a found list
-    def extract_section_data(ul_node, is_juco_check=False):
-        res = {'stars': '0', 'rating': 'NA', 'year': 'NA', 'ranks': {}}
-        if not ul_node: return res
-        
-        container = ul_node.find_parent('section') or ul_node.find_parent('div')
-        if not container: return res
-        
-        full_text = container.get_text()
-        
-        # Year
-        ym = re.search(r'\((\d{4})\)', full_text)
-        if ym: res['year'] = ym.group(1)
-        
-        # Stars
-        is_juco = "JUCO" in full_text.upper()
-        stars = container.select('.icon-starsolid.yellow')
-        
-        star_count = str(len(stars))
-        if is_juco and is_juco_check:
-            res['stars'] = f"{star_count} JUCO"
-        else:
-            res['stars'] = star_count
+    if transfer_node:
+        # Robust Container Finding: Try parent section, then parent div
+        t_container = transfer_node.find_parent('section') or transfer_node.find_parent('div')
+        if t_container:
+            # STARS
+            stars = t_container.select('.icon-starsolid.yellow')
+            data['Transfer Stars'] = len(stars)
             
-        # Rating
-        rating = container.select_one('.rating') or container.select_one('.score')
-        if rating:
-            val = clean_text(rating.get_text())
-            res['rating'] = f"{val} JUCO" if (is_juco and is_juco_check) else val
+            # RATING
+            rating = t_container.select_one('.rating')
+            if rating: 
+                data['Transfer Rating'] = clean_text(rating.text)
+            else:
+                # Fallback: Find 2-digit number (70-99) in text if class is missing
+                txt = t_container.get_text()
+                match = re.search(r'\b(7\d|8\d|9\d)\b', txt)
+                if match: data['Transfer Rating'] = match.group(1)
             
-        # Ranks
-        for li in ul_node.find_all('li'):
-            lbl = li.select_one('h5, .rank-label')
-            val = li.select_one('strong, .rank-value')
-            if lbl and val:
-                l_txt = lbl.get_text(strip=True).upper()
-                v_txt = clean_text(val.get_text(strip=True))
+            # RANKS (Negative Logic)
+            for li in t_container.select('li'):
+                label_tag = li.select_one('h5')
+                val_tag = li.select_one('strong')
                 
-                if 'OVR' in l_txt: res['ranks']['OVR'] = v_txt
-                elif 'NATL' in l_txt or 'NATIONAL' in l_txt: res['ranks']['NATL'] = v_txt
-                elif 'POS' in l_txt or 'QB' in l_txt or 'WR' in l_txt or 'S' in l_txt: res['ranks']['POS'] = v_txt
-        
-        # Apply JUCO label to ranks if needed
-        if is_juco and is_juco_check:
-             for k in res['ranks']: 
-                 if res['ranks'][k] != "NA":
-                     res['ranks'][k] = f"{res['ranks'][k]} JUCO"
-                     
-        return res
+                if label_tag and val_tag:
+                    label = label_tag.get_text(strip=True).upper()
+                    val = clean_text(val_tag.get_text(strip=True))
+                    
+                    if 'OVR' in label:
+                        data['Transfer Overall Rank'] = val
+                    elif label not in ['NATL', 'NATIONAL', 'ST', 'STATE']: 
+                        # If it's not Overall or National/State, it IS the Position Rank
+                        # This catches "S" even if player is "WR"
+                        data['Transfer Position Rank'] = val
 
-    # Extract Transfer
-    t_data = extract_section_data(transfer_ul, is_juco_check=False)
-    data['Transfer Stars'] = t_data['stars']
-    data['Transfer Rating'] = t_data['rating']
-    data['Transfer Year'] = t_data['year']
-    data['Transfer Overall Rank'] = t_data['ranks'].get('OVR', 'NA')
-    data['Transfer Position Rank'] = t_data['ranks'].get('POS', 'NA')
+    # --- PARSE PROSPECT ("As a Prospect") ---
+    data['Prospect Stars'] = "0"
+    data['Prospect Rating'] = "NA"
+    data['Prospect Position Rank'] = "NA"
+    data['Prospect National Rank'] = "NA"
     
-    # Extract Prospect
-    p_data = extract_section_data(prospect_ul, is_juco_check=True)
-    data['Prospect Stars'] = p_data['stars']
-    data['Prospect Rating'] = p_data['rating']
-    data['Prospect National Rank'] = p_data['ranks'].get('NATL', 'NA')
-    data['Prospect Position Rank'] = p_data['ranks'].get('POS', 'NA')
+    if prospect_node:
+        p_container = prospect_node.find_parent('section') or prospect_node.find_parent('div')
+        if p_container:
+            # Check JUCO
+            header_text = p_container.get_text()
+            is_juco = "JUCO" in header_text.upper()
+            
+            # Stars
+            stars = p_container.select('.icon-starsolid.yellow')
+            if is_juco and len(stars) == 0:
+                data['Prospect Stars'] = "0 JUCO"
+            else:
+                data['Prospect Stars'] = f"{len(stars)} JUCO" if is_juco else len(stars)
+                
+            # Rating
+            rating = p_container.select_one('.rating')
+            if rating: 
+                val = clean_text(rating.text)
+                data['Prospect Rating'] = f"{val} JUCO" if (is_juco and val != "NA") else val
+            elif is_juco:
+                data['Prospect Rating'] = "NA JUCO"
+            
+            # Ranks (Negative Logic)
+            for li in p_container.select('li'):
+                label_tag = li.select_one('h5')
+                val_tag = li.select_one('strong')
+                
+                if label_tag and val_tag:
+                    label = label_tag.get_text(strip=True).upper()
+                    val = clean_text(val_tag.get_text(strip=True))
+                    
+                    if 'NATL' in label or 'NATIONAL' in label:
+                        data['Prospect National Rank'] = f"{val} JUCO" if is_juco else val
+                    elif label not in ['OVR', 'ST', 'STATE', 'AK', 'AL', 'AR', 'AZ', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA', 'HI', 'IA', 'ID', 'IL', 'IN', 'KS', 'KY', 'LA', 'MA', 'MD', 'ME', 'MI', 'MN', 'MO', 'MS', 'MT', 'NC', 'ND', 'NE', 'NH', 'NJ', 'NM', 'NV', 'NY', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VA', 'VT', 'WA', 'WI', 'WV', 'WY']:
+                        # Exclude State Abbreviations to avoid grabbing State Rank
+                        # Everything else is Position Rank
+                        data['Prospect Position Rank'] = f"{val} JUCO" if is_juco else val
 
     return data
 
@@ -183,10 +177,12 @@ async def scrape_profile(context, url, sem, failed_urls):
     async with sem:
         for attempt in range(MAX_RETRIES):
             page = await context.new_page()
+            # Block media for speed
             await page.route("**/*.{png,jpg,jpeg,svg,mp4,woff,woff2}", lambda route: route.abort())
             try:
                 await random_delay()
                 await page.goto(url, timeout=60000, wait_until="commit")
+                
                 try: await page.wait_for_selector(".name, h1.name", timeout=15000)
                 except: pass
                 
@@ -213,7 +209,7 @@ async def scrape_profile(context, url, sem, failed_urls):
 
 async def main():
     ua = UserAgent()
-    print("--- Starting FINAL Scraper (Robust Version) ---")
+    print("--- Starting FINAL Scraper (Negative Logic + Broadnet) ---")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -243,4 +239,28 @@ async def main():
         
         # 3. EXTRACT
         links = await page.eval_on_selector_all("a[href*='/player/']", "elements => elements.map(e => e.href)")
-        links = list(set(
+        links = list(set([l for l in links if "247sports.com/player/" in l]))
+        print(f"   Found {len(links)} profiles.")
+        await page.close()
+
+        # 4. SCRAPE
+        sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        failed_urls = []
+        tasks = [scrape_profile(context, link, sem, failed_urls) for link in links]
+        results = await asyncio.gather(*tasks)
+        
+        df = pd.DataFrame([r for r in results if r])
+        cols = [
+            "247 ID", "Player Name", "Position", "Height", "Weight", "High School", "City, ST", "EXP", "Team",
+            "Transfer Stars", "Transfer Rating", "Transfer Year", "Transfer Overall Rank", "Transfer Position Rank", "Transfer Team Name",
+            "Prospect Stars", "Prospect Rating", "Prospect Position Rank", "Prospect National Rank", "URL"
+        ]
+        df = df.reindex(columns=cols)
+        df.to_csv(OUTPUT_FILE, index=False)
+        print(f"--- DONE. Saved {len(df)} rows. ---")
+        
+        if failed_urls: pd.DataFrame(failed_urls).to_csv("failed_urls.csv", index=False)
+        await browser.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
