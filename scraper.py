@@ -14,7 +14,7 @@ MAX_RETRIES = 5
 OUTPUT_FILE = f"transfer_portal_2026_FINAL_{datetime.now().strftime('%Y%m%d')}.csv"
 
 # ⭐ TEST MODE
-TEST_MODE = True
+TEST_MODE = False
 TEST_LIMIT = 50
 
 # --- UTILS ---
