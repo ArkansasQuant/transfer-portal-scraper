@@ -14,7 +14,7 @@ MAX_RETRIES = 5
 OUTPUT_FILE = f"transfer_portal_2026_FINAL_{datetime.now().strftime('%Y%m%d')}.csv"
 
 # ⭐ TEST MODE
-TEST_MODE = False
+TEST_MODE = True
 TEST_LIMIT = 50
 
 # --- UTILS ---
@@ -71,17 +71,19 @@ def parse_profile(html, url, player_id):
             if match: data['EXP'] = match.group(1).strip()
 
     # --- TEAM LOGIC ---
+    # Current Team (Origination)
     data['Team'] = "NA"
-    logo = soup.select_one('.primary-team-logo')
-    if logo and logo.get('alt'):
-        data['Team'] = logo.get('alt')
-    elif soup.select_one('.ni-school-name a'):
-        data['Team'] = soup.select_one('.ni-school-name a').text.strip()
-
+    team_header = soup.select_one('.team-info-section header h2')
+    if team_header:
+        data['Team'] = team_header.text.strip()
+    
+    # Transfer Destination Team
     data['Transfer Team Name'] = "NA"
-    banner = soup.select_one('.qa-team-name')
-    if banner:
-        data['Transfer Team Name'] = banner.text.strip()
+    commit_banner = soup.select_one('.commit-banner span')
+    if commit_banner:
+        team_text = commit_banner.text.strip()
+        if team_text and team_text != "Commit":
+            data['Transfer Team Name'] = team_text
     
     # --- PARSE TRANSFER AND PROSPECT BY TITLE ---
     data['Transfer Stars'] = "0"
@@ -89,11 +91,13 @@ def parse_profile(html, url, player_id):
     data['Transfer Year'] = "2026"
     data['Transfer Overall Rank'] = "NA"
     data['Transfer Position Rank'] = "NA"
+    data['Transfer Position'] = "NA"
     
     data['Prospect Stars'] = "0"
     data['Prospect Rating'] = "NA"
     data['Prospect Position Rank'] = "NA"
     data['Prospect National Rank'] = "NA"
+    data['Prospect Position'] = "NA"
     
     # Find all rankings sections
     all_rankings = soup.select('section.rankings-section')
@@ -120,7 +124,7 @@ def parse_profile(html, url, player_id):
                 if match:
                     data['Transfer Rating'] = match.group(1)
             
-            # Ranks
+            # Ranks and Position
             for li in section.select('li'):
                 bold_tag = li.find('b')
                 if not bold_tag:
@@ -135,17 +139,22 @@ def parse_profile(html, url, player_id):
                 
                 if 'OVR' in bold_text:
                     data['Transfer Overall Rank'] = rank_number
-                elif data['Position'] and bold_text == data['Position'].upper():
+                elif data['Transfer Position Rank'] == 'NA':
+                    # This is the position rank
                     data['Transfer Position Rank'] = rank_number
+                    data['Transfer Position'] = bold_text
         
         # PROSPECT SECTION
         elif title == "247Sports" or "JUCO" in title:
             is_juco = "JUCO" in title
             
-            # Stars
-            stars = section.select('span.icon-starsolid.yellow')
-            if stars:
-                data['Prospect Stars'] = str(min(len(stars), 5))
+            # Stars - check for JUCO
+            if is_juco:
+                data['Prospect Stars'] = "JUCO"
+            else:
+                stars = section.select('span.icon-starsolid.yellow')
+                if stars:
+                    data['Prospect Stars'] = str(min(len(stars), 5))
             
             # Rating
             rating_block = section.select_one('.rank-block')
@@ -153,10 +162,9 @@ def parse_profile(html, url, player_id):
                 rating_text = rating_block.get_text(strip=True)
                 match = re.search(r'^(\d+)', rating_text)
                 if match:
-                    r_text = match.group(1)
-                    data['Prospect Rating'] = r_text if r_text != 'N/A' else 'NA'
+                    data['Prospect Rating'] = match.group(1)
             
-            # Ranks
+            # Ranks and Position
             for li in section.select('li'):
                 bold_tag = li.find('b')
                 if not bold_tag:
@@ -176,16 +184,13 @@ def parse_profile(html, url, player_id):
                 # National Rank
                 if 'NATL' in bold_text or 'NATIONAL' in bold_text:
                     data['Prospect National Rank'] = rank_number
-                # State rank - skip it (check URL for State=)
+                # State rank - skip it
                 elif 'State=' in link_url:
                     continue
                 # Position Rank - check URL for Position= or positionKey=
                 elif ('Position=' in link_url or 'positionKey=' in link_url) and data['Prospect Position Rank'] == 'NA':
                     data['Prospect Position Rank'] = rank_number
-            
-            # Set JUCO if detected
-            if is_juco and data['Prospect National Rank'] == 'NA':
-                data['Prospect National Rank'] = 'JUCO'
+                    data['Prospect Position'] = bold_text
 
     return data
 
@@ -294,8 +299,8 @@ async def main():
         df = pd.DataFrame(valid_results)
         cols = [
             "247 ID", "Player Name", "Position", "Height", "Weight", "High School", "City, ST", "EXP", "Team",
-            "Transfer Stars", "Transfer Rating", "Transfer Year", "Transfer Overall Rank", "Transfer Position Rank", "Transfer Team Name",
-            "Prospect Stars", "Prospect Rating", "Prospect Position Rank", "Prospect National Rank", "URL"
+            "Transfer Stars", "Transfer Rating", "Transfer Year", "Transfer Overall Rank", "Transfer Position Rank", "Transfer Position", "Transfer Team Name",
+            "Prospect Stars", "Prospect Rating", "Prospect Position Rank", "Prospect Position", "Prospect National Rank", "URL"
         ]
         df = df.reindex(columns=cols)
         
