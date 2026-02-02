@@ -6,25 +6,16 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime
 from fake_useragent import UserAgent
-from pathlib import Path
 
 # --- CONFIGURATION ---
 BASE_URL = "https://247sports.com/season/2026-football/transferportalpositionranking/"
-CONCURRENCY_LIMIT = 4   # Safe speed for overnight run
-MAX_RETRIES = 5         # High persistence for network blips
+CONCURRENCY_LIMIT = 4
+MAX_RETRIES = 5
 OUTPUT_FILE = f"transfer_portal_2026_FINAL_{datetime.now().strftime('%Y%m%d')}.csv"
 
-# ⭐ TEST MODE - Set to True to only scrape first 50 players
+# ⭐ TEST MODE
 TEST_MODE = True  # Change to False for full scrape
-TEST_LIMIT = 50   # Number of players to test with
-
-# ⭐ DEBUG MODE - Save HTML files for debugging
-DEBUG_MODE = True  # Set to False to disable HTML saving
-DEBUG_DIR = Path('debug_html')  # Directory for debug files
-
-# Create debug directory if needed
-if DEBUG_MODE:
-    DEBUG_DIR.mkdir(exist_ok=True)
+TEST_LIMIT = 50
 
 # --- UTILS ---
 def clean_text(text):
@@ -36,7 +27,6 @@ def extract_id_from_url(url):
     return match.group(1) if match else "NA"
 
 async def random_delay():
-    # 1-2 second delay to be polite and avoid blocks
     await asyncio.sleep(random.uniform(1.0, 2.0))
 
 # --- PARSING LOGIC ---
@@ -57,7 +47,7 @@ def parse_profile(html, url, player_id):
     data['City, ST'] = "NA"
     data['EXP'] = "NA"
     
-    # Header Parsing (Handles "CityWest Linn" glued text issue)
+    # Header Parsing
     all_header_items = soup.select('.metrics-list li') + soup.select('.details li')
     for item in all_header_items:
         text = item.get_text(strip=True)
@@ -81,8 +71,6 @@ def parse_profile(html, url, player_id):
             if match: data['EXP'] = match.group(1).strip()
 
     # --- TEAM LOGIC ---
-    
-    # 1. "Team" (Current/Previous School)
     data['Team'] = "NA"
     logo = soup.select_one('.primary-team-logo')
     if logo and logo.get('alt'):
@@ -90,7 +78,6 @@ def parse_profile(html, url, player_id):
     elif soup.select_one('.ni-school-name a'):
         data['Team'] = soup.select_one('.ni-school-name a').text.strip()
 
-    # 2. "Transfer Team Name" (Destination School)
     data['Transfer Team Name'] = "NA"
     banner = soup.select_one('.qa-team-name')
     if banner:
@@ -107,29 +94,41 @@ def parse_profile(html, url, player_id):
     if transfer_node:
         t_container = transfer_node.find_parent('section') or transfer_node.find_parent('div')
         if t_container:
-            # Stars - count actual elements, cap at 5
-            stars = t_container.select('.icon-starsolid.yellow')
+            # Stars - correct selector
+            stars = t_container.select('span.icon-starsolid.yellow')
             if stars:
                 star_count = len(stars)
                 data['Transfer Stars'] = str(min(star_count, 5))
             
-            rating = t_container.select_one('.rating')
-            if rating: data['Transfer Rating'] = rating.text.strip()
+            # Rating - use regex to extract just the number
+            rating_block = t_container.select_one('.rank-block')
+            if rating_block:
+                rating_text = rating_block.get_text(strip=True)
+                # Extract just the first number (before year in parentheses)
+                match = re.search(r'^(\d+)', rating_text)
+                if match:
+                    data['Transfer Rating'] = match.group(1)
             
+            # Ranks - from <strong> tags
             for li in t_container.select('li'):
-                text = li.get_text(" ", strip=True).upper()
+                bold_tag = li.find('b')
+                if not bold_tag:
+                    continue
+                
+                bold_text = bold_tag.get_text(strip=True).upper()
+                strong_tag = li.find('strong')
+                if not strong_tag:
+                    continue
+                
+                rank_number = strong_tag.get_text(strip=True)
                 
                 # OVR Rank
-                if 'OVR' in text:
-                    match = re.search(r'(\d+)', text)
-                    if match: data['Transfer Overall Rank'] = match.group(1)
+                if 'OVR' in bold_text:
+                    data['Transfer Overall Rank'] = rank_number
                 
-                # CRITICAL FIX: Check bold tag contains exact position
-                elif li.find('b'):
-                    bold_text = li.find('b').get_text(strip=True).upper()
-                    if data['Position'] and bold_text == data['Position'].upper():
-                        match = re.search(r'(\d+)', text)
-                        if match: data['Transfer Position Rank'] = match.group(1)
+                # Position Rank - exact match
+                elif data['Position'] and bold_text == data['Position'].upper():
+                    data['Transfer Position Rank'] = rank_number
 
     # --- PARSE PROSPECT ("As a Prospect") ---
     data['Prospect Stars'] = "0"
@@ -141,49 +140,52 @@ def parse_profile(html, url, player_id):
     if prospect_node:
         p_container = prospect_node.find_parent('section') or prospect_node.find_parent('div')
         if p_container:
-            # Check for JUCO header
+            # Check for JUCO
             is_juco = "JUCO" in p_container.get_text()
             
-            # Stars - count actual elements, cap at 5
-            stars = p_container.select('.icon-starsolid.yellow')
+            # Stars
+            stars = p_container.select('span.icon-starsolid.yellow')
             if stars:
                 star_count = len(stars)
                 data['Prospect Stars'] = str(min(star_count, 5))
             elif is_juco and len(stars) == 0:
-                # JUCO with no stars - leave as "0" or could set to "NA"
                 pass
-                
-            rating = p_container.select_one('.rating')
-            if rating: 
-                r_text = rating.text.strip()
-                data['Prospect Rating'] = r_text if r_text != 'N/A' else 'NA'
             
+            # Rating - use regex to extract just the number
+            rating_block = p_container.select_one('.rank-block')
+            if rating_block:
+                rating_text = rating_block.get_text(strip=True)
+                match = re.search(r'^(\d+)', rating_text)
+                if match:
+                    r_text = match.group(1)
+                    data['Prospect Rating'] = r_text if r_text != 'N/A' else 'NA'
+            
+            # Ranks - from <strong> tags, skip state ranks
             for li in p_container.select('li'):
-                text = li.get_text(" ", strip=True).upper()
-                if "N/A" in text: continue
-
                 bold_tag = li.find('b')
                 if not bold_tag:
                     continue
                 
                 bold_text = bold_tag.get_text(strip=True).upper()
+                strong_tag = li.find('strong')
+                if not strong_tag:
+                    continue
+                
+                rank_number = strong_tag.get_text(strip=True)
                 
                 # National Rank
                 if 'NATL' in bold_text or 'NATIONAL' in bold_text:
-                    match = re.search(r'(\d+)', text)
-                    if match: data['Prospect National Rank'] = match.group(1)
+                    data['Prospect National Rank'] = rank_number
                 
-                # CRITICAL FIX: Skip 2-letter state codes (GA, TX, KS, etc.)
+                # Skip 2-letter state codes
                 elif len(bold_text) == 2 and bold_text.isalpha():
-                    continue  # This is a state rank - skip it
+                    continue
                 
-                # CRITICAL FIX: Take ANY position rank (not just current position)
-                # This handles position changes like S -> WR
+                # Position Rank - capture ANY position (not just current)
                 elif data['Prospect Position Rank'] == 'NA':
-                    match = re.search(r'(\d+)', text)
-                    if match: data['Prospect Position Rank'] = match.group(1)
+                    data['Prospect Position Rank'] = rank_number
             
-            # Set JUCO in National Rank if it's a JUCO player with no NATL rank
+            # Set JUCO if detected
             if is_juco and data['Prospect National Rank'] == 'NA':
                 data['Prospect National Rank'] = 'JUCO'
 
@@ -193,28 +195,15 @@ async def scrape_profile(context, url, sem, failed_urls):
     async with sem:
         for attempt in range(MAX_RETRIES):
             page = await context.new_page()
-            # Block media for speed/stability
             await page.route("**/*.{png,jpg,jpeg,svg,mp4,woff,woff2}", lambda route: route.abort())
             try:
                 await random_delay()
                 await page.goto(url, timeout=60000, wait_until="commit")
                 
-                # Smart wait for name
                 try: await page.wait_for_selector(".name, h1.name", timeout=15000)
                 except: pass
                 
                 content = await page.content()
-                
-                # ⭐ DEBUG: Save HTML for debugging
-                if DEBUG_MODE:
-                    player_id = extract_id_from_url(url)
-                    debug_file = DEBUG_DIR / f'player_{player_id}.html'
-                    with open(debug_file, 'w', encoding='utf-8') as f:
-                        f.write(f'<!-- URL: {url} -->\n')
-                        f.write(f'<!-- Player ID: {player_id} -->\n')
-                        f.write(f'<!-- Scraped: {datetime.now().isoformat()} -->\n')
-                        f.write(content)
-                
                 if "Player Profile" not in content and "name" not in content:
                     raise Exception("Blank content")
 
@@ -243,9 +232,6 @@ async def main():
         print(f"🧪 TEST MODE - Scraping first {TEST_LIMIT} players")
         print("="*80)
     
-    if DEBUG_MODE:
-        print(f"🐛 DEBUG MODE - Saving HTML to {DEBUG_DIR}/")
-    
     print("--- Starting Scraper ---")
     
     async with async_playwright() as p:
@@ -253,13 +239,11 @@ async def main():
         context = await browser.new_context(user_agent=ua.random, viewport={'width': 1920, 'height': 1080})
         page = await context.new_page()
         
-        # 1. LOAD MAIN LIST
         print(f"--- 1. Loading Main List ---")
         await page.goto(BASE_URL, timeout=120000, wait_until="commit")
         try: await page.wait_for_selector(".rankings-page__name-link", timeout=30000)
         except: pass
 
-        # 2. CLICK LOAD MORE
         if not TEST_MODE:
             print("--- 2. Expanding List (Clicking Load More) ---")
             for i in range(300):
@@ -284,7 +268,6 @@ async def main():
             print("--- 2. TEST MODE: Loading only first page ---")
             await asyncio.sleep(2)
         
-        # 3. EXTRACT LINKS
         print("--- 3. Extracting Profile Links ---")
         links = await page.eval_on_selector_all("a[href*='/player/']", "elements => elements.map(e => e.href)")
         unique_links = list(set([l for l in links if "247sports.com/player/" in l]))
@@ -302,7 +285,6 @@ async def main():
             await browser.close()
             return
 
-        # 4. SCRAPE PROFILES
         print("--- 4. Scraping Profiles ---")
         sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
         failed_urls = []
@@ -311,7 +293,6 @@ async def main():
         results = await asyncio.gather(*tasks)
         valid_results = [r for r in results if r]
         
-        # 5. SAVE
         df = pd.DataFrame(valid_results)
         cols = [
             "247 ID", "Player Name", "Position", "Height", "Weight", "High School", "City, ST", "EXP", "Team",
@@ -325,8 +306,6 @@ async def main():
         
         print("="*80)
         print(f"{'🧪 TEST COMPLETE' if TEST_MODE else 'SUCCESS'} - Saved {len(df)} rows to {output_filename}")
-        if DEBUG_MODE:
-            print(f"🐛 Debug HTML files saved to {DEBUG_DIR}/")
         print("="*80)
         
         if failed_urls:
