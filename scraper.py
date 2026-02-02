@@ -14,7 +14,7 @@ MAX_RETRIES = 5
 OUTPUT_FILE = f"transfer_portal_2026_FINAL_{datetime.now().strftime('%Y%m%d')}.csv"
 
 # ⭐ TEST MODE
-TEST_MODE = True  # Change to False for full scrape
+TEST_MODE = True
 TEST_LIMIT = 50
 
 # --- UTILS ---
@@ -83,34 +83,45 @@ def parse_profile(html, url, player_id):
     if banner:
         data['Transfer Team Name'] = banner.text.strip()
     
-    # --- PARSE TRANSFER ("As a Transfer") ---
+    # --- PARSE TRANSFER AND PROSPECT BY TITLE ---
     data['Transfer Stars'] = "0"
     data['Transfer Rating'] = "NA"
     data['Transfer Year'] = "2026"
     data['Transfer Overall Rank'] = "NA"
     data['Transfer Position Rank'] = "NA"
-
-    transfer_node = soup.find(string=re.compile("As a Transfer"))
-    if transfer_node:
-        t_container = transfer_node.find_parent('section') or transfer_node.find_parent('div')
-        if t_container:
-            # Stars - correct selector
-            stars = t_container.select('span.icon-starsolid.yellow')
-            if stars:
-                star_count = len(stars)
-                data['Transfer Stars'] = str(min(star_count, 5))
+    
+    data['Prospect Stars'] = "0"
+    data['Prospect Rating'] = "NA"
+    data['Prospect Position Rank'] = "NA"
+    data['Prospect National Rank'] = "NA"
+    
+    # Find all rankings sections
+    all_rankings = soup.select('section.rankings-section')
+    
+    for section in all_rankings:
+        title_tag = section.select_one('h3.title')
+        if not title_tag:
+            continue
             
-            # Rating - use regex to extract just the number
-            rating_block = t_container.select_one('.rank-block')
+        title = title_tag.get_text(strip=True)
+        
+        # TRANSFER SECTION
+        if "Transfer" in title:
+            # Stars
+            stars = section.select('span.icon-starsolid.yellow')
+            if stars:
+                data['Transfer Stars'] = str(min(len(stars), 5))
+            
+            # Rating
+            rating_block = section.select_one('.rank-block')
             if rating_block:
                 rating_text = rating_block.get_text(strip=True)
-                # Extract just the first number (before year in parentheses)
                 match = re.search(r'^(\d+)', rating_text)
                 if match:
                     data['Transfer Rating'] = match.group(1)
             
-            # Ranks - from <strong> tags
-            for li in t_container.select('li'):
+            # Ranks
+            for li in section.select('li'):
                 bold_tag = li.find('b')
                 if not bold_tag:
                     continue
@@ -122,37 +133,22 @@ def parse_profile(html, url, player_id):
                 
                 rank_number = strong_tag.get_text(strip=True)
                 
-                # OVR Rank
                 if 'OVR' in bold_text:
                     data['Transfer Overall Rank'] = rank_number
-                
-                # Position Rank - exact match
                 elif data['Position'] and bold_text == data['Position'].upper():
                     data['Transfer Position Rank'] = rank_number
-
-    # --- PARSE PROSPECT ("As a Prospect") ---
-    data['Prospect Stars'] = "0"
-    data['Prospect Rating'] = "NA"
-    data['Prospect Position Rank'] = "NA"
-    data['Prospect National Rank'] = "NA"
-    
-    prospect_node = soup.find(string=re.compile("As a Prospect"))
-    if prospect_node:
-        p_container = prospect_node.find_parent('section') or prospect_node.find_parent('div')
-        if p_container:
-            # Check for JUCO
-            is_juco = "JUCO" in p_container.get_text()
+        
+        # PROSPECT SECTION
+        elif title == "247Sports" or "JUCO" in title:
+            is_juco = "JUCO" in title
             
             # Stars
-            stars = p_container.select('span.icon-starsolid.yellow')
+            stars = section.select('span.icon-starsolid.yellow')
             if stars:
-                star_count = len(stars)
-                data['Prospect Stars'] = str(min(star_count, 5))
-            elif is_juco and len(stars) == 0:
-                pass
+                data['Prospect Stars'] = str(min(len(stars), 5))
             
-            # Rating - use regex to extract just the number
-            rating_block = p_container.select_one('.rank-block')
+            # Rating
+            rating_block = section.select_one('.rank-block')
             if rating_block:
                 rating_text = rating_block.get_text(strip=True)
                 match = re.search(r'^(\d+)', rating_text)
@@ -160,8 +156,8 @@ def parse_profile(html, url, player_id):
                     r_text = match.group(1)
                     data['Prospect Rating'] = r_text if r_text != 'N/A' else 'NA'
             
-            # Ranks - from <strong> tags, skip state ranks
-            for li in p_container.select('li'):
+            # Ranks
+            for li in section.select('li'):
                 bold_tag = li.find('b')
                 if not bold_tag:
                     continue
@@ -173,16 +169,18 @@ def parse_profile(html, url, player_id):
                 
                 rank_number = strong_tag.get_text(strip=True)
                 
+                # Check link URL to distinguish position vs state ranks
+                link_tag = li.find('a')
+                link_url = link_tag.get('href', '') if link_tag else ''
+                
                 # National Rank
                 if 'NATL' in bold_text or 'NATIONAL' in bold_text:
                     data['Prospect National Rank'] = rank_number
-                
-                # Skip 2-letter state codes
-                elif len(bold_text) == 2 and bold_text.isalpha():
+                # State rank - skip it (check URL for State=)
+                elif 'State=' in link_url:
                     continue
-                
-                # Position Rank - capture ANY position (not just current)
-                elif data['Prospect Position Rank'] == 'NA':
+                # Position Rank - check URL for Position= or positionKey=
+                elif ('Position=' in link_url or 'positionKey=' in link_url) and data['Prospect Position Rank'] == 'NA':
                     data['Prospect Position Rank'] = rank_number
             
             # Set JUCO if detected
