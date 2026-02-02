@@ -6,6 +6,7 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime
 from fake_useragent import UserAgent
+from pathlib import Path
 
 # --- CONFIGURATION ---
 BASE_URL = "https://247sports.com/season/2026-football/transferportalpositionranking/"
@@ -16,6 +17,14 @@ OUTPUT_FILE = f"transfer_portal_2026_FINAL_{datetime.now().strftime('%Y%m%d')}.c
 # ⭐ TEST MODE - Set to True to only scrape first 50 players
 TEST_MODE = True  # Change to False for full scrape
 TEST_LIMIT = 50   # Number of players to test with
+
+# ⭐ DEBUG MODE - Save HTML files for debugging
+DEBUG_MODE = True  # Set to False to disable HTML saving
+DEBUG_DIR = Path('debug_html')  # Directory for debug files
+
+# Create debug directory if needed
+if DEBUG_MODE:
+    DEBUG_DIR.mkdir(exist_ok=True)
 
 # --- UTILS ---
 def clean_text(text):
@@ -195,6 +204,17 @@ async def scrape_profile(context, url, sem, failed_urls):
                 except: pass
                 
                 content = await page.content()
+                
+                # ⭐ DEBUG: Save HTML for debugging
+                if DEBUG_MODE:
+                    player_id = extract_id_from_url(url)
+                    debug_file = DEBUG_DIR / f'player_{player_id}.html'
+                    with open(debug_file, 'w', encoding='utf-8') as f:
+                        f.write(f'<!-- URL: {url} -->\n')
+                        f.write(f'<!-- Player ID: {player_id} -->\n')
+                        f.write(f'<!-- Scraped: {datetime.now().isoformat()} -->\n')
+                        f.write(content)
+                
                 if "Player Profile" not in content and "name" not in content:
                     raise Exception("Blank content")
 
@@ -222,6 +242,9 @@ async def main():
         print("="*80)
         print(f"🧪 TEST MODE - Scraping first {TEST_LIMIT} players")
         print("="*80)
+    
+    if DEBUG_MODE:
+        print(f"🐛 DEBUG MODE - Saving HTML to {DEBUG_DIR}/")
     
     print("--- Starting Scraper ---")
     
@@ -302,6 +325,8 @@ async def main():
         
         print("="*80)
         print(f"{'🧪 TEST COMPLETE' if TEST_MODE else 'SUCCESS'} - Saved {len(df)} rows to {output_filename}")
+        if DEBUG_MODE:
+            print(f"🐛 Debug HTML files saved to {DEBUG_DIR}/")
         print("="*80)
         
         if failed_urls:
