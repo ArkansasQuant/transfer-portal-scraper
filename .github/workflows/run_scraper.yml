@@ -1,36 +1,42 @@
 name: Run Transfer Portal Scraper
-
 on:
   workflow_dispatch:
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 360  # 6 Hours allowed for 1,500+ players
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
-
+    
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
-
+    
     - name: Install dependencies
       run: |
         pip install -r requirements.txt
         playwright install chromium
         playwright install-deps
-
+    
     - name: Run Scraper
       run: python scraper.py
-
-    - name: Upload Data
+    
+    - name: Upload CSV Data
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: Scraper_Output
+        name: CSV_Output
         path: |
           *.csv
-          failed_urls.csv
+        retention-days: 90
+    
+    - name: Upload Debug HTML Files
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: Debug_HTML_Files
+        path: |
+          debug_html/*.html
+        retention-days: 7
