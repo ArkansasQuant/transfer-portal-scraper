@@ -65,27 +65,3 @@ jobs:
         path: |
           debug_html/*.html
         retention-days: 7
-```
-
----
-
-## 🎯 **What This Adds:**
-
-### **1. Dropdown Menus When You Run the Workflow:**
-
-When you click "Run workflow", you'll now see:
-```
-Run workflow from branch: main
-
-Test Mode (true = 50 players, false = full scrape)
-  [v] true ▼
-      - true
-      - false
-
-Number of players to validate for accuracy  
-  [v] 20 ▼
-      - 10
-      - 20
-      - 50
-
-[Run workflow]
