@@ -8,10 +8,15 @@ from datetime import datetime
 from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
-BASE_URL = "https://247sports.com/season/2026-football/transferportalpositionranking/"
+BASE_URL_TEMPLATE = "https://247sports.com/season/{year}-football/transferportalpositionranking/"
+
+# ⭐ YEARS TO SCRAPE (in order - newest first)
+YEARS = [2026, 2025, 2024]  # Start with recent 3 years
+# YEARS = [2026, 2025, 2024, 2023, 2022, 2021]  # Uncomment for all 6 years
+
 CONCURRENCY_LIMIT = 4
 MAX_RETRIES = 5
-OUTPUT_FILE = f"transfer_portal_2026_FINAL_{datetime.now().strftime('%Y%m%d')}.csv"
+OUTPUT_FILE = f"transfer_portal_{min(YEARS)}-{max(YEARS)}_{datetime.now().strftime('%Y%m%d')}.csv"
 
 # ⭐ TEST MODE
 TEST_MODE = True
@@ -88,7 +93,7 @@ def parse_profile(html, url, player_id):
     # --- PARSE TRANSFER AND PROSPECT BY TITLE ---
     data['Transfer Stars'] = "0"
     data['Transfer Rating'] = "NA"
-    data['Transfer Year'] = "2026"
+    data['Transfer Year'] = "NA"  # Will extract from page
     data['Transfer Overall Rank'] = "NA"
     data['Transfer Position Rank'] = "NA"
     data['Transfer Position'] = "NA"
@@ -116,13 +121,18 @@ def parse_profile(html, url, player_id):
             if stars:
                 data['Transfer Stars'] = str(min(len(stars), 5))
             
-            # Rating
+            # Rating and Year (extract year from rating block)
             rating_block = section.select_one('.rank-block')
             if rating_block:
                 rating_text = rating_block.get_text(strip=True)
+                # Extract rating (number before year)
                 match = re.search(r'^(\d+)', rating_text)
                 if match:
                     data['Transfer Rating'] = match.group(1)
+                # Extract year from (YYYY) format
+                year_match = re.search(r'\((\d{4})\)', rating_text)
+                if year_match:
+                    data['Transfer Year'] = year_match.group(1)
             
             # Ranks and Position
             for li in section.select('li'):
@@ -215,11 +225,9 @@ async def scrape_profile(context, url, sem, failed_urls):
                 data['URL'] = url
                 
                 await page.close()
-                print(f"   [SUCCESS] {data['Player Name']}")
                 return data
 
             except Exception as e:
-                print(f"   [ERROR] {url}: {e}")
                 await page.close()
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(5)
@@ -227,96 +235,133 @@ async def scrape_profile(context, url, sem, failed_urls):
                     failed_urls.append({'url': url, 'reason': str(e)})
                     return None
 
+async def scrape_year(year, p, ua):
+    """Scrape all players for a specific year"""
+    print("\n" + "="*80)
+    print(f"📅 SCRAPING YEAR: {year}")
+    print("="*80)
+    
+    base_url = BASE_URL_TEMPLATE.format(year=year)
+    
+    browser = await p.chromium.launch(headless=True)
+    context = await browser.new_context(user_agent=ua.random, viewport={'width': 1920, 'height': 1080})
+    page = await context.new_page()
+    
+    print(f"--- 1. Loading {year} Transfer Portal List ---")
+    await page.goto(base_url, timeout=120000, wait_until="commit")
+    try: await page.wait_for_selector(".rankings-page__name-link", timeout=30000)
+    except: pass
+
+    if not TEST_MODE:
+        print(f"--- 2. Expanding {year} List (Clicking Load More) ---")
+        for i in range(300):
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1)
+                
+                load_more = page.locator("text=Load More Players").or_(page.locator(".showmore_lnk"))
+                
+                if await load_more.count() > 0 and await load_more.first.is_visible():
+                    await load_more.first.click()
+                    await asyncio.sleep(4)
+                else:
+                    await asyncio.sleep(2)
+                    if await load_more.count() == 0:
+                        print(f"   ✅ {year}: Full list loaded")
+                        break
+            except Exception as e:
+                print(f"   Loop error: {e}")
+                break
+    else:
+        print(f"--- 2. TEST MODE: Loading only first page of {year} ---")
+        await asyncio.sleep(2)
+    
+    print(f"--- 3. Extracting {year} Profile Links ---")
+    links = await page.eval_on_selector_all("a[href*='/player/']", "elements => elements.map(e => e.href)")
+    unique_links = list(set([l for l in links if "247sports.com/player/" in l]))
+    
+    if TEST_MODE:
+        unique_links = unique_links[:TEST_LIMIT]
+        print(f"   🧪 {year}: Limited to {len(unique_links)} profiles")
+    else:
+        print(f"   ✅ {year}: Found {len(unique_links)} unique profiles")
+    
+    await page.close()
+
+    if len(unique_links) == 0:
+        print(f"   ⚠️ {year}: No links found")
+        await browser.close()
+        return [], []
+
+    print(f"--- 4. Scraping {year} Profiles ---")
+    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    failed_urls = []
+    tasks = [scrape_profile(context, link, sem, failed_urls) for link in unique_links]
+    
+    results = await asyncio.gather(*tasks)
+    valid_results = [r for r in results if r]
+    
+    print(f"   ✅ {year}: Scraped {len(valid_results)} players")
+    if failed_urls:
+        print(f"   ⚠️ {year}: {len(failed_urls)} profiles failed")
+    
+    await browser.close()
+    return valid_results, failed_urls
+
 async def main():
     ua = UserAgent()
     
+    print("="*80)
     if TEST_MODE:
-        print("="*80)
-        print(f"🧪 TEST MODE - Scraping first {TEST_LIMIT} players")
-        print("="*80)
+        print(f"🧪 TEST MODE - Scraping {TEST_LIMIT} players per year")
+    else:
+        print(f"🚀 FULL MODE - Scraping all players")
+    print(f"📅 Years to scrape: {', '.join(map(str, YEARS))}")
+    print("="*80)
     
-    print("--- Starting Scraper ---")
+    all_results = []
+    all_failed = []
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=ua.random, viewport={'width': 1920, 'height': 1080})
-        page = await context.new_page()
-        
-        print(f"--- 1. Loading Main List ---")
-        await page.goto(BASE_URL, timeout=120000, wait_until="commit")
-        try: await page.wait_for_selector(".rankings-page__name-link", timeout=30000)
-        except: pass
-
-        if not TEST_MODE:
-            print("--- 2. Expanding List (Clicking Load More) ---")
-            for i in range(300):
-                try:
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(1)
-                    
-                    load_more = page.locator("text=Load More Players").or_(page.locator(".showmore_lnk"))
-                    
-                    if await load_more.count() > 0 and await load_more.first.is_visible():
-                        await load_more.first.click()
-                        await asyncio.sleep(4)
-                    else:
-                        await asyncio.sleep(2)
-                        if await load_more.count() == 0:
-                            print("   No more buttons. Full list loaded.")
-                            break
-                except Exception as e:
-                    print(f"   Loop minor error: {e}")
-                    break
-        else:
-            print("--- 2. TEST MODE: Loading only first page ---")
-            await asyncio.sleep(2)
-        
-        print("--- 3. Extracting Profile Links ---")
-        links = await page.eval_on_selector_all("a[href*='/player/']", "elements => elements.map(e => e.href)")
-        unique_links = list(set([l for l in links if "247sports.com/player/" in l]))
-        
-        if TEST_MODE:
-            unique_links = unique_links[:TEST_LIMIT]
-            print(f"   🧪 Limited to {len(unique_links)} profiles")
-        else:
-            print(f"   Found {len(unique_links)} unique profiles to scrape.")
-        
-        await page.close()
-
-        if len(unique_links) == 0:
-            print("CRITICAL: No links found. Aborting.")
-            await browser.close()
-            return
-
-        print("--- 4. Scraping Profiles ---")
-        sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
-        failed_urls = []
-        tasks = [scrape_profile(context, link, sem, failed_urls) for link in unique_links]
-        
-        results = await asyncio.gather(*tasks)
-        valid_results = [r for r in results if r]
-        
-        df = pd.DataFrame(valid_results)
-        cols = [
-            "247 ID", "Player Name", "Position", "Height", "Weight", "High School", "City, ST", "EXP", "Team",
-            "Transfer Stars", "Transfer Rating", "Transfer Year", "Transfer Overall Rank", "Transfer Position Rank", "Transfer Position", "Transfer Team Name",
-            "Prospect Stars", "Prospect Rating", "Prospect Position Rank", "Prospect Position", "Prospect National Rank", "URL"
-        ]
-        df = df.reindex(columns=cols)
-        
-        output_filename = f"TEST_{OUTPUT_FILE}" if TEST_MODE else OUTPUT_FILE
-        df.to_csv(output_filename, index=False)
-        
-        print("="*80)
-        print(f"{'🧪 TEST COMPLETE' if TEST_MODE else 'SUCCESS'} - Saved {len(df)} rows to {output_filename}")
-        print("="*80)
-        
-        if failed_urls:
-            print(f"   Note: {len(failed_urls)} profiles failed.")
-            failed_file = f"TEST_failed_urls.csv" if TEST_MODE else "failed_urls.csv"
-            pd.DataFrame(failed_urls).to_csv(failed_file, index=False)
-
-        await browser.close()
+        for year in YEARS:
+            year_results, year_failed = await scrape_year(year, p, ua)
+            all_results.extend(year_results)
+            all_failed.extend([{**f, 'year': year} for f in year_failed])
+    
+    # Create final DataFrame
+    if len(all_results) == 0:
+        print("\n❌ No data scraped. Exiting.")
+        return
+    
+    df = pd.DataFrame(all_results)
+    cols = [
+        "247 ID", "Player Name", "Position", "Height", "Weight", "High School", "City, ST", "EXP", "Team",
+        "Transfer Stars", "Transfer Rating", "Transfer Year", "Transfer Overall Rank", "Transfer Position Rank", "Transfer Position", "Transfer Team Name",
+        "Prospect Stars", "Prospect Rating", "Prospect Position Rank", "Prospect Position", "Prospect National Rank", "URL"
+    ]
+    df = df.reindex(columns=cols)
+    
+    output_filename = f"TEST_{OUTPUT_FILE}" if TEST_MODE else OUTPUT_FILE
+    df.to_csv(output_filename, index=False)
+    
+    print("\n" + "="*80)
+    print(f"{'🧪 TEST COMPLETE' if TEST_MODE else '✅ SUCCESS'}")
+    print(f"📊 Total players scraped: {len(df)}")
+    print(f"📁 Saved to: {output_filename}")
+    print("="*80)
+    
+    # Show breakdown by year
+    if 'Transfer Year' in df.columns:
+        year_counts = df['Transfer Year'].value_counts().sort_index(ascending=False)
+        print("\n📅 Players by Transfer Year:")
+        for year, count in year_counts.items():
+            print(f"   {year}: {count} players")
+    
+    if all_failed:
+        print(f"\n⚠️ Total failed: {len(all_failed)} profiles")
+        failed_file = f"TEST_failed_urls.csv" if TEST_MODE else "failed_urls.csv"
+        pd.DataFrame(all_failed).to_csv(failed_file, index=False)
+        print(f"   Failed URLs saved to: {failed_file}")
 
 if __name__ == "__main__":
     asyncio.run(main())
