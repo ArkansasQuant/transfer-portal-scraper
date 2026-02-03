@@ -23,7 +23,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 Hours allowed for 1,500+ players
+    timeout-minutes: 360
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -57,11 +57,12 @@ jobs:
           *.csv
         retention-days: 90
     
-    - name: Upload Debug HTML Files
+    - name: Upload Diagnostic Report
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: Debug_HTML_Files
+        name: Diagnostics
         path: |
-          debug_html/*.html
-        retention-days: 7
+          diagnostics_report.txt
+          diagnostic_html/*.html
+        retention-days: 30
