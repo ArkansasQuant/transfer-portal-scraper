@@ -2,6 +2,7 @@ import asyncio
 import random
 import pandas as pd
 import re
+import os
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -18,8 +19,8 @@ CONCURRENCY_LIMIT = 4
 MAX_RETRIES = 5
 OUTPUT_FILE = f"transfer_portal_{min(YEARS)}-{max(YEARS)}_{datetime.now().strftime('%Y%m%d')}.csv"
 
-# ⭐ TEST MODE
-TEST_MODE = True
+# ⭐ TEST MODE (controlled by GitHub Actions or defaults to True)
+TEST_MODE = os.getenv('TEST_MODE', 'true').lower() == 'true'
 TEST_LIMIT = 50
 
 # --- UTILS ---
@@ -93,7 +94,7 @@ def parse_profile(html, url, player_id):
     # --- PARSE TRANSFER AND PROSPECT BY TITLE ---
     data['Transfer Stars'] = "0"
     data['Transfer Rating'] = "NA"
-    data['Transfer Year'] = "NA"  # Will extract from page
+    data['Transfer Year'] = "NA"
     data['Transfer Overall Rank'] = "NA"
     data['Transfer Position Rank'] = "NA"
     data['Transfer Position'] = "NA"
