@@ -1,6 +1,25 @@
 name: Run Transfer Portal Scraper
 on:
   workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Test Mode (true = 50 players, false = full scrape)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      validation_sample:
+        description: 'Number of players to validate for accuracy'
+        required: false
+        default: '20'
+        type: choice
+        options:
+          - '10'
+          - '20'
+          - '50'
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -22,6 +41,12 @@ jobs:
     
     - name: Run Scraper
       run: python scraper.py
+      env:
+        TEST_MODE: ${{ github.event.inputs.test_mode }}
+    
+    - name: Validate Accuracy
+      run: python validate_accuracy.py TEST_*.csv ${{ github.event.inputs.validation_sample }}
+      if: always()
     
     - name: Upload CSV Data
       uses: actions/upload-artifact@v4
@@ -40,3 +65,27 @@ jobs:
         path: |
           debug_html/*.html
         retention-days: 7
+```
+
+---
+
+## 🎯 **What This Adds:**
+
+### **1. Dropdown Menus When You Run the Workflow:**
+
+When you click "Run workflow", you'll now see:
+```
+Run workflow from branch: main
+
+Test Mode (true = 50 players, false = full scrape)
+  [v] true ▼
+      - true
+      - false
+
+Number of players to validate for accuracy  
+  [v] 20 ▼
+      - 10
+      - 20
+      - 50
+
+[Run workflow]
