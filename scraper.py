@@ -12,8 +12,9 @@ from fake_useragent import UserAgent
 BASE_URL_TEMPLATE = "https://247sports.com/season/{year}-football/transferportalpositionranking/"
 
 # ⭐ YEARS TO SCRAPE (in order - newest first)
-YEARS = [2023, 2022, 2021]  # Start with recent 3 years
-# YEARS = [2026, 2025, 2024, 2023, 2022, 2021]  # Uncomment for all 6 years
+YEARS = [2026, 2025, 2024]  # Start with recent 3 years
+# YEARS = [2023, 2022, 2021]  # Test older years separately
+# YEARS = [2026, 2025, 2024, 2023, 2022, 2021]  # All 6 years
 
 CONCURRENCY_LIMIT = 4
 MAX_RETRIES = 5
@@ -22,6 +23,10 @@ OUTPUT_FILE = f"transfer_portal_{min(YEARS)}-{max(YEARS)}_{datetime.now().strfti
 # ⭐ TEST MODE (controlled by GitHub Actions or defaults to True)
 TEST_MODE = os.getenv('TEST_MODE', 'true').lower() == 'true'
 TEST_LIMIT = 50
+
+# ⭐ DIAGNOSTICS MODE (saves problem HTML files for debugging)
+DIAGNOSTICS_MODE = True
+MAX_DIAGNOSTIC_SAMPLES = 5  # Save up to 5 problem HTML files per year
 
 # --- UTILS ---
 def clean_text(text):
@@ -35,8 +40,24 @@ def extract_id_from_url(url):
 async def random_delay():
     await asyncio.sleep(random.uniform(1.0, 2.0))
 
+def save_diagnostic_html(html, filename):
+    """Save problematic HTML for debugging"""
+    try:
+        os.makedirs('diagnostic_html', exist_ok=True)
+        filepath = f"diagnostic_html/{filename}"
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(html)
+        return filepath
+    except Exception as e:
+        print(f"   ⚠️ Failed to save diagnostic HTML: {e}")
+        return None
+
 # --- PARSING LOGIC ---
-def parse_profile(html, url, player_id):
+def parse_profile(html, url, player_id, scraping_year):
+    """
+    Parse player profile HTML
+    scraping_year: The year we're scraping from (2026, 2025, etc.) - used as fallback
+    """
     soup = BeautifulSoup(html, 'lxml')
     data = {}
     
@@ -202,10 +223,14 @@ def parse_profile(html, url, player_id):
                 elif ('Position=' in link_url or 'positionKey=' in link_url) and data['Prospect Position Rank'] == 'NA':
                     data['Prospect Position Rank'] = rank_number
                     data['Prospect Position'] = bold_text
+    
+    # ⭐ FALLBACK: Use scraping year if Transfer Year not found
+    if data['Transfer Year'] == "NA":
+        data['Transfer Year'] = str(scraping_year)
 
     return data
 
-async def scrape_profile(context, url, sem, failed_urls):
+async def scrape_profile(context, url, sem, failed_urls, scraping_year, diagnostic_tracker):
     async with sem:
         for attempt in range(MAX_RETRIES):
             page = await context.new_page()
@@ -222,8 +247,12 @@ async def scrape_profile(context, url, sem, failed_urls):
                     raise Exception("Blank content")
 
                 player_id = extract_id_from_url(url)
-                data = parse_profile(content, url, player_id)
+                data = parse_profile(content, url, player_id, scraping_year)
                 data['URL'] = url
+                
+                # Track diagnostics
+                if DIAGNOSTICS_MODE:
+                    track_diagnostics(data, content, scraping_year, diagnostic_tracker)
                 
                 await page.close()
                 return data
@@ -233,10 +262,64 @@ async def scrape_profile(context, url, sem, failed_urls):
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(5)
                 else:
-                    failed_urls.append({'url': url, 'reason': str(e)})
+                    failed_urls.append({'url': url, 'reason': str(e), 'year': scraping_year})
                     return None
 
-async def scrape_year(year, p, ua):
+def track_diagnostics(data, html, year, tracker):
+    """Track field completeness and save problematic HTML samples"""
+    
+    # Initialize year tracker
+    if year not in tracker['by_year']:
+        tracker['by_year'][year] = {
+            'total': 0,
+            'fields': {},
+            'problem_samples': []
+        }
+    
+    tracker['by_year'][year]['total'] += 1
+    
+    # Track each field
+    fields_to_track = [
+        'Transfer Stars', 'Transfer Rating', 'Transfer Year', 'Transfer Overall Rank',
+        'Transfer Position Rank', 'Transfer Position', 'Transfer Team Name',
+        'Prospect Stars', 'Prospect Rating', 'Prospect Position Rank',
+        'Prospect Position', 'Prospect National Rank'
+    ]
+    
+    has_issues = False
+    missing_fields = []
+    
+    for field in fields_to_track:
+        # Initialize field counter
+        if field not in tracker['by_year'][year]['fields']:
+            tracker['by_year'][year]['fields'][field] = {'filled': 0, 'na': 0}
+        
+        # Count filled vs NA
+        value = data.get(field, 'NA')
+        if value == 'NA' or value == '0':
+            tracker['by_year'][year]['fields'][field]['na'] += 1
+            missing_fields.append(field)
+            has_issues = True
+        else:
+            tracker['by_year'][year]['fields'][field]['filled'] += 1
+    
+    # Save sample HTML if this player has issues
+    if has_issues and len(tracker['by_year'][year]['problem_samples']) < MAX_DIAGNOSTIC_SAMPLES:
+        player_id = data.get('247 ID', 'unknown')
+        player_name = data.get('Player Name', 'unknown')
+        filename = f"problem_{year}_{player_id}.html"
+        saved_path = save_diagnostic_html(html, filename)
+        
+        if saved_path:
+            tracker['by_year'][year]['problem_samples'].append({
+                'player': player_name,
+                'id': player_id,
+                'url': data.get('URL', 'unknown'),
+                'missing_fields': missing_fields,
+                'html_file': filename
+            })
+
+async def scrape_year(year, p, ua, diagnostic_tracker):
     """Scrape all players for a specific year"""
     print("\n" + "="*80)
     print(f"📅 SCRAPING YEAR: {year}")
@@ -297,7 +380,7 @@ async def scrape_year(year, p, ua):
     print(f"--- 4. Scraping {year} Profiles ---")
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     failed_urls = []
-    tasks = [scrape_profile(context, link, sem, failed_urls) for link in unique_links]
+    tasks = [scrape_profile(context, link, sem, failed_urls, year, diagnostic_tracker) for link in unique_links]
     
     results = await asyncio.gather(*tasks)
     valid_results = [r for r in results if r]
@@ -309,6 +392,59 @@ async def scrape_year(year, p, ua):
     await browser.close()
     return valid_results, failed_urls
 
+def generate_diagnostic_report(diagnostic_tracker, output_file="diagnostics_report.txt"):
+    """Generate detailed diagnostic report"""
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("="*80 + "\n")
+        f.write("🔍 DIAGNOSTIC REPORT\n")
+        f.write("="*80 + "\n\n")
+        
+        for year in sorted(diagnostic_tracker['by_year'].keys(), reverse=True):
+            year_data = diagnostic_tracker['by_year'][year]
+            total = year_data['total']
+            
+            f.write(f"\n{'='*80}\n")
+            f.write(f"📅 YEAR {year} ({total} players)\n")
+            f.write(f"{'='*80}\n\n")
+            
+            # Field completeness
+            f.write("FIELD COMPLETENESS:\n")
+            f.write("-" * 80 + "\n")
+            
+            for field, counts in sorted(year_data['fields'].items()):
+                filled = counts['filled']
+                na = counts['na']
+                pct = (filled / total * 100) if total > 0 else 0
+                
+                status = "✅" if pct >= 95 else ("⚠️" if pct >= 80 else "❌")
+                f.write(f"{status} {field:30} {filled:4d}/{total:4d} ({pct:5.1f}%)\n")
+            
+            # Problem samples
+            if year_data['problem_samples']:
+                f.write(f"\n🔴 PROBLEMATIC PLAYERS (saved {len(year_data['problem_samples'])} samples):\n")
+                f.write("-" * 80 + "\n")
+                
+                for sample in year_data['problem_samples']:
+                    f.write(f"\nPlayer: {sample['player']} (ID: {sample['id']})\n")
+                    f.write(f"URL: {sample['url']}\n")
+                    f.write(f"HTML File: {sample['html_file']}\n")
+                    f.write(f"Missing Fields: {', '.join(sample['missing_fields'][:5])}\n")
+        
+        f.write("\n" + "="*80 + "\n")
+        f.write("📊 SUMMARY\n")
+        f.write("="*80 + "\n")
+        
+        for year in sorted(diagnostic_tracker['by_year'].keys(), reverse=True):
+            year_data = diagnostic_tracker['by_year'][year]
+            total = year_data['total']
+            problem_count = len(year_data['problem_samples'])
+            
+            status = "✅" if problem_count == 0 else ("⚠️" if problem_count < 5 else "❌")
+            f.write(f"{status} {year}: {total} players scraped, {problem_count} problem samples saved\n")
+    
+    print(f"\n📋 Diagnostic report saved to: {output_file}")
+
 async def main():
     ua = UserAgent()
     
@@ -318,16 +454,19 @@ async def main():
     else:
         print(f"🚀 FULL MODE - Scraping all players")
     print(f"📅 Years to scrape: {', '.join(map(str, YEARS))}")
+    if DIAGNOSTICS_MODE:
+        print(f"🔍 DIAGNOSTICS MODE: Enabled (saving up to {MAX_DIAGNOSTIC_SAMPLES} problem HTML files per year)")
     print("="*80)
     
     all_results = []
     all_failed = []
+    diagnostic_tracker = {'by_year': {}}
     
     async with async_playwright() as p:
         for year in YEARS:
-            year_results, year_failed = await scrape_year(year, p, ua)
+            year_results, year_failed = await scrape_year(year, p, ua, diagnostic_tracker)
             all_results.extend(year_results)
-            all_failed.extend([{**f, 'year': year} for f in year_failed])
+            all_failed.extend(year_failed)
     
     # Create final DataFrame
     if len(all_results) == 0:
@@ -363,6 +502,10 @@ async def main():
         failed_file = f"TEST_failed_urls.csv" if TEST_MODE else "failed_urls.csv"
         pd.DataFrame(all_failed).to_csv(failed_file, index=False)
         print(f"   Failed URLs saved to: {failed_file}")
+    
+    # Generate diagnostic report
+    if DIAGNOSTICS_MODE and diagnostic_tracker['by_year']:
+        generate_diagnostic_report(diagnostic_tracker)
 
 if __name__ == "__main__":
     asyncio.run(main())
