@@ -13,7 +13,7 @@ BASE_URL_TEMPLATE = "https://247sports.com/season/{year}-football/transferportal
 
 # ⭐ YEARS TO SCRAPE (in order - newest first)
 # YEARS = [2026, 2025, 2024]  # Recent 3 years
-YEARS = [2023, 2022, 2021]  # Testing older years
+YEARS = [2026, 2025, 2024]  # Testing older years
 # YEARS = [2026, 2025, 2024, 2023, 2022, 2021]  # All 6 years
 
 CONCURRENCY_LIMIT = 4
