@@ -1,68 +1,67 @@
 name: Run Transfer Portal Scraper
+
 on:
   workflow_dispatch:
     inputs:
+      year_range:
+        description: 'Year range to scrape'
+        required: true
+        default: '2024-2026'
+        type: choice
+        options:
+          - '2024-2026'
+          - '2021-2023'
+          - 'all'
       test_mode:
-        description: 'Test Mode (true = 50 players, false = full scrape)'
-        required: false
-        default: 'true'
+        description: 'Test mode (50 players per year)'
+        required: true
+        default: 'false'
         type: choice
         options:
-          - 'true'
           - 'false'
-      validation_sample:
-        description: 'Number of players to validate for accuracy'
-        required: false
-        default: '20'
-        type: choice
-        options:
-          - '10'
-          - '20'
-          - '50'
+          - 'true'
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360  # 6 hour max
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
-    
-    - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
-        playwright install chromium
-        playwright install-deps
-    
-    - name: Run Scraper
-      run: python scraper.py
-      env:
-        TEST_MODE: ${{ github.event.inputs.test_mode }}
-    
-    - name: Validate Accuracy
-      run: python validate_accuracy.py TEST_*.csv ${{ github.event.inputs.validation_sample }}
-      if: always()
-    
-    - name: Upload CSV Data
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: CSV_Output
-        path: |
-          *.csv
-        retention-days: 90
-    
-    - name: Upload Diagnostic Report
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: Diagnostics
-        path: |
-          diagnostics_report.txt
-          diagnostic_html/*.html
-        retention-days: 30
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps
+
+      - name: Run scraper
+        env:
+          YEAR_RANGE: ${{ github.event.inputs.year_range }}
+          TEST_MODE: ${{ github.event.inputs.test_mode }}
+        run: python scraper.py
+
+      - name: Upload CSV results
+        uses: actions/upload-artifact@v4
+        with:
+          name: transfer-portal-data-${{ github.event.inputs.year_range }}
+          path: |
+            *.csv
+          retention-days: 90
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ github.event.inputs.year_range }}
+          path: |
+            diagnostics_report.txt
+            diagnostic_html/
+          if-no-files-found: ignore
+          retention-days: 30
