@@ -3,6 +3,7 @@ import random
 import pandas as pd
 import re
 import os
+import urllib.parse
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -11,10 +12,16 @@ from fake_useragent import UserAgent
 # --- CONFIGURATION ---
 BASE_URL_TEMPLATE = "https://247sports.com/season/{year}-football/transferportalpositionranking/"
 
-# ⭐ YEARS TO SCRAPE (in order - newest first)
-# YEARS = [2026, 2025, 2024]  # Recent 3 years
-YEARS = [2023, 2022, 2021]  # Testing older years
-# YEARS = [2026, 2025, 2024, 2023, 2022, 2021]  # All 6 years
+# ⭐ YEARS TO SCRAPE (controlled by GitHub Actions dropdown or defaults to 2024-2026)
+YEAR_RANGE = os.getenv('YEAR_RANGE', '2024-2026')
+if YEAR_RANGE == '2021-2023':
+    YEARS = [2023, 2022, 2021]
+elif YEAR_RANGE == '2024-2026':
+    YEARS = [2026, 2025, 2024]
+elif YEAR_RANGE == 'all':
+    YEARS = [2026, 2025, 2024, 2023, 2022, 2021]
+else:
+    YEARS = [2026, 2025, 2024]  # Default fallback
 
 CONCURRENCY_LIMIT = 4
 MAX_RETRIES = 5
@@ -36,6 +43,24 @@ def clean_text(text):
 def extract_id_from_url(url):
     match = re.search(r'-(\d+)(?:/|$)', url)
     return match.group(1) if match else "NA"
+
+def normalize_player_url(url):
+    """
+    Normalize 247Sports player URLs to prevent duplicate entries.
+    Strips the /college-XXXXX/ suffix since the same player gets different
+    college IDs per transfer event, causing false "unique" URLs.
+
+    Example:
+      .../player/reuben-unije-84039/college-257852/  →  .../player/reuben-unije-84039/
+      .../player/reuben-unije-84039/college-310931/  →  .../player/reuben-unije-84039/
+    """
+    match = re.match(r'(https://247sports\.com/player/[^/]+/)', url)
+    if match:
+        return match.group(1)
+    # Fallback: strip query params and trailing slash
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.rstrip('/')
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
 
 async def random_delay():
     await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -319,6 +344,7 @@ def track_diagnostics(data, html, year, tracker):
                 'html_file': filename
             })
 
+# --- IMPROVED scrape_year WITH ALL FIXES ---
 async def scrape_year(year, p, ua, diagnostic_tracker):
     """Scrape all players for a specific year"""
     print("\n" + "="*80)
@@ -331,15 +357,54 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     context = await browser.new_context(user_agent=ua.random, viewport={'width': 1920, 'height': 1080})
     page = await context.new_page()
     
+    # ---------------------------------------------------------------
+    # STEP 1: Load the transfer portal list page
+    # ---------------------------------------------------------------
     print(f"--- 1. Loading {year} Transfer Portal List ---")
-    await page.goto(base_url, timeout=120000, wait_until="commit")
-    try: await page.wait_for_selector(".rankings-page__name-link", timeout=30000)
-    except: pass
+    await page.goto(base_url, timeout=120000, wait_until="domcontentloaded")
+    try:
+        await page.wait_for_selector(".rankings-page__name-link", timeout=30000)
+    except:
+        pass
 
+    # 🔧 FIX: Capture expected total from page header
+    expected_total = None
+    try:
+        for selector in [
+            ".rankings-page__header .total",
+            ".result-count",
+            ".rankings-page__header",
+            "h1",
+        ]:
+            try:
+                el = page.locator(selector).first
+                if await el.count() > 0:
+                    text = await el.text_content()
+                    match = re.search(r'(\d{3,})', text)  # Look for 3+ digit number
+                    if match:
+                        expected_total = int(match.group(1))
+                        print(f"   📊 {year}: Page reports {expected_total} total players")
+                        break
+            except:
+                continue
+        if expected_total is None:
+            print(f"   ⚠️ {year}: Could not determine expected player count from page")
+    except:
+        pass
+
+    # ---------------------------------------------------------------
+    # STEP 2: Expand full list by clicking "Load More"
+    # ---------------------------------------------------------------
     if not TEST_MODE:
         print(f"--- 2. Expanding {year} List (Clicking Load More) ---")
-        for i in range(300):
+        
+        consecutive_failures = 0  # 🔧 FIX: track consecutive errors instead of breaking on first
+        clicks_made = 0
+        no_button_checks = 0
+        
+        for i in range(500):  # 🔧 FIX: increased from 300 to 500 for safety
             try:
+                # Scroll to bottom to trigger lazy loading
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(1)
                 
@@ -347,28 +412,118 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
                 
                 if await load_more.count() > 0 and await load_more.first.is_visible():
                     await load_more.first.click()
-                    await asyncio.sleep(4)
+                    clicks_made += 1
+                    consecutive_failures = 0  # 🔧 FIX: reset on success
+                    no_button_checks = 0
+                    await asyncio.sleep(5)  # 🔧 FIX: increased from 4 to 5
+                    
+                    # Progress logging every 25 clicks
+                    if clicks_made % 25 == 0:
+                        try:
+                            current_count = await page.eval_on_selector_all(
+                                "a[href*='/player/']",
+                                "elements => elements.length"
+                            )
+                            print(f"   📈 {year}: {clicks_made} clicks, ~{current_count} links so far")
+                        except:
+                            print(f"   📈 {year}: {clicks_made} clicks")
                 else:
                     await asyncio.sleep(2)
-                    if await load_more.count() == 0:
-                        print(f"   ✅ {year}: Full list loaded")
+                    no_button_checks += 1
+                    
+                    # 🔧 FIX: require 3 consecutive "no button" checks before declaring done
+                    # Prevents premature exit when button temporarily disappears during content load
+                    if no_button_checks >= 3:
+                        print(f"   ✅ {year}: Full list loaded ({clicks_made} total clicks)")
                         break
+                        
             except Exception as e:
-                print(f"   Loop error: {e}")
-                break
+                consecutive_failures += 1
+                print(f"   ⚠️ Load More error ({consecutive_failures}/10): {e}")
+                await asyncio.sleep(3)
+                
+                # 🔧 FIX: only break after 10 CONSECUTIVE failures, not 1
+                if consecutive_failures >= 10:
+                    print(f"   ❌ {year}: Too many consecutive failures after {clicks_made} clicks")
+                    break
+                continue  # 🔧 FIX: was `break` — this is the CRITICAL change
+        
+        # 🔧 FIX: Post-loop verification — make sure Load More is truly gone
+        await asyncio.sleep(3)
+        try:
+            final_check = page.locator("text=Load More Players").or_(page.locator(".showmore_lnk"))
+            if await final_check.count() > 0 and await final_check.first.is_visible():
+                print(f"   ⚠️ {year}: Load More still visible after loop! Running cleanup...")
+                for _ in range(50):
+                    try:
+                        if await final_check.count() > 0 and await final_check.first.is_visible():
+                            await final_check.first.click()
+                            await asyncio.sleep(5)
+                        else:
+                            break
+                    except:
+                        continue
+                print(f"   ✅ {year}: Cleanup complete")
+        except:
+            pass
     else:
         print(f"--- 2. TEST MODE: Loading only first page of {year} ---")
         await asyncio.sleep(2)
     
+    # ---------------------------------------------------------------
+    # STEP 3: Extract player profile links
+    # ---------------------------------------------------------------
     print(f"--- 3. Extracting {year} Profile Links ---")
-    links = await page.eval_on_selector_all("a[href*='/player/']", "elements => elements.map(e => e.href)")
-    unique_links = list(set([l for l in links if "247sports.com/player/" in l]))
+    
+    # 🔧 FIX: Use multiple selectors for robustness
+    links_primary = await page.eval_on_selector_all(
+        "a[href*='/player/']",
+        "elements => elements.map(e => e.href)"
+    )
+    links_backup = await page.eval_on_selector_all(
+        ".rankings-page__name-link",
+        "elements => elements.map(e => e.href)"
+    )
+    
+    # Combine all sources
+    all_links = links_primary + links_backup
+    
+    # 🔧 FIX: Normalize URLs before deduplicating (strips /college-XXXXX/ suffix)
+    unique_links = list(set(
+        normalize_player_url(l)
+        for l in all_links
+        if "247sports.com/player/" in l
+    ))
+    
+    # 🔧 FIX: Count visible list items for validation
+    try:
+        visible_items = await page.eval_on_selector_all(
+            ".rankings-page__list-item",
+            "elements => elements.length"
+        )
+        print(f"   📊 {year}: Visible list items on page: {visible_items}")
+    except:
+        visible_items = None
     
     if TEST_MODE:
         unique_links = unique_links[:TEST_LIMIT]
         print(f"   🧪 {year}: Limited to {len(unique_links)} profiles")
     else:
         print(f"   ✅ {year}: Found {len(unique_links)} unique profiles")
+    
+    # 🔧 FIX: Validate against expected total
+    if expected_total and not TEST_MODE:
+        coverage = len(unique_links) / expected_total * 100
+        if coverage >= 95:
+            print(f"   ✅ {year}: Coverage {coverage:.1f}% ({len(unique_links)}/{expected_total})")
+        elif coverage >= 80:
+            print(f"   ⚠️ {year}: Coverage {coverage:.1f}% ({len(unique_links)}/{expected_total}) — some players may be missing")
+        else:
+            print(f"   ❌ {year}: Coverage {coverage:.1f}% ({len(unique_links)}/{expected_total}) — SIGNIFICANT DATA LOSS")
+    
+    if visible_items and not TEST_MODE:
+        if len(unique_links) < visible_items:
+            print(f"   ⚠️ {year}: {visible_items - len(unique_links)} visible items have no extractable link!")
     
     await page.close()
 
@@ -377,6 +532,9 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
         await browser.close()
         return [], []
 
+    # ---------------------------------------------------------------
+    # STEP 4: Scrape individual profiles
+    # ---------------------------------------------------------------
     print(f"--- 4. Scraping {year} Profiles ---")
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     failed_urls = []
@@ -454,6 +612,7 @@ async def main():
     else:
         print(f"🚀 FULL MODE - Scraping all players")
     print(f"📅 Years to scrape: {', '.join(map(str, YEARS))}")
+    print(f"📅 Year range setting: {YEAR_RANGE}")
     if DIAGNOSTICS_MODE:
         print(f"🔍 DIAGNOSTICS MODE: Enabled (saving up to {MAX_DIAGNOSTIC_SAMPLES} problem HTML files per year)")
     print("="*80)
