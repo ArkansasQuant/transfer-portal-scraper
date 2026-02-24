@@ -49,20 +49,23 @@ def extract_id_from_url(url):
 def normalize_player_url(url):
     """
     Normalize 247Sports player URLs to prevent duplicate entries.
-    Strips the /college-XXXXX/ suffix since the same player gets different
-    college IDs per transfer event, causing false "unique" URLs.
+    Handles: www vs non-www, http vs https, trailing slash, query params,
+    and /college-XXXXX/ or /junior-college-XXXXX/ suffixes.
 
     Example:
-      .../player/reuben-unije-84039/college-257852/  →  .../player/reuben-unije-84039/
-      .../player/reuben-unije-84039/college-310931/  →  .../player/reuben-unije-84039/
+      https://www.247sports.com/player/reuben-unije-84039/college-257852/  →  https://247sports.com/player/reuben-unije-84039/
+      http://247sports.com/player/reuben-unije-84039  →  https://247sports.com/player/reuben-unije-84039/
     """
-    match = re.match(r'(https://247sports\.com/player/[^/]+/)', url)
+    # Strip www, force https, remove query params
+    url = url.split('?')[0].split('#')[0]
+    url = url.replace('://www.', '://')
+    url = url.replace('http://', 'https://')
+    
+    # Extract base player URL (strip /college-X/, /junior-college-X/, /high-school-X/)
+    match = re.match(r'(https://247sports\.com/player/[^/]+)', url)
     if match:
-        return match.group(1)
-    # Fallback: strip query params and trailing slash
-    parsed = urllib.parse.urlparse(url)
-    path = parsed.path.rstrip('/')
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
+        return match.group(1) + '/'
+    return url
 
 async def random_delay():
     await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -545,18 +548,27 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     # ---------------------------------------------------------------
     print(f"--- 3. Extracting {year} Profile Links ---")
     
-    # 🔧 FIX: Use multiple selectors for robustness
+    # Use the specific list-item selector first (only matches transfer portal list entries)
     links_primary = await page.eval_on_selector_all(
-        "a[href*='/player/']",
-        "elements => elements.map(e => e.href)"
-    )
-    links_backup = await page.eval_on_selector_all(
         ".rankings-page__name-link",
         "elements => elements.map(e => e.href)"
     )
     
-    # Combine all sources
-    all_links = links_primary + links_backup
+    # Fallback: scope to list container to avoid sidebar/news/trending links
+    if len(links_primary) == 0:
+        links_primary = await page.eval_on_selector_all(
+            ".rankings-page__list-item a[href*='/player/']",
+            "elements => elements.map(e => e.href)"
+        )
+    
+    # Last resort: broad selector (but likely to include non-list links)
+    if len(links_primary) == 0:
+        links_primary = await page.eval_on_selector_all(
+            "a[href*='/player/']",
+            "elements => elements.map(e => e.href)"
+        )
+    
+    all_links = links_primary
     
     # 🔧 FIX: Normalize URLs before deduplicating (strips /college-XXXXX/ suffix)
     unique_links = list(set(
@@ -709,6 +721,14 @@ async def main():
         "Prospect Stars", "Prospect Rating", "Prospect Position Rank", "Prospect Position", "Prospect National Rank", "URL"
     ]
     df = df.reindex(columns=cols)
+    
+    # Dedup: drop exact duplicate rows, then deduplicate by (247 ID, Transfer Year)
+    before_dedup = len(df)
+    df = df.drop_duplicates()
+    df = df.drop_duplicates(subset=['247 ID', 'Transfer Year'], keep='first')
+    after_dedup = len(df)
+    if before_dedup != after_dedup:
+        print(f"   🧹 Removed {before_dedup - after_dedup} duplicate rows ({before_dedup} → {after_dedup})")
     
     output_filename = OUTPUT_FILE
     df.to_csv(output_filename, index=False)
