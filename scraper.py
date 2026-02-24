@@ -25,12 +25,13 @@ else:
 
 CONCURRENCY_LIMIT = 4
 MAX_RETRIES = 5
-MODE_LABEL = "TEST" if TEST_MODE else "FULL"
-OUTPUT_FILE = f"transfer_portal_{min(YEARS)}-{max(YEARS)}_{MODE_LABEL}_{datetime.now().strftime('%Y%m%d')}.csv"
 
 # ⭐ TEST MODE (controlled by GitHub Actions or defaults to True)
 TEST_MODE = os.getenv('TEST_MODE', 'true').lower() == 'true'
 TEST_LIMIT = 50
+
+MODE_LABEL = "TEST" if TEST_MODE else "FULL"
+OUTPUT_FILE = f"transfer_portal_{min(YEARS)}-{max(YEARS)}_{MODE_LABEL}_{datetime.now().strftime('%Y%m%d')}.csv"
 
 # ⭐ DIAGNOSTICS MODE (saves problem HTML files for debugging)
 DIAGNOSTICS_MODE = True
