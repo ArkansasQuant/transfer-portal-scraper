@@ -25,7 +25,8 @@ else:
 
 CONCURRENCY_LIMIT = 4
 MAX_RETRIES = 5
-OUTPUT_FILE = f"transfer_portal_{min(YEARS)}-{max(YEARS)}_{datetime.now().strftime('%Y%m%d')}.csv"
+MODE_LABEL = "TEST" if TEST_MODE else "FULL"
+OUTPUT_FILE = f"transfer_portal_{min(YEARS)}-{max(YEARS)}_{MODE_LABEL}_{datetime.now().strftime('%Y%m%d')}.csv"
 
 # ⭐ TEST MODE (controlled by GitHub Actions or defaults to True)
 TEST_MODE = os.getenv('TEST_MODE', 'true').lower() == 'true'
@@ -357,6 +358,12 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     context = await browser.new_context(user_agent=ua.random, viewport={'width': 1920, 'height': 1080})
     page = await context.new_page()
     
+    # 🔧 FIX: Block ad/overlay scripts that intercept clicks
+    await page.route("**/*bouncex*", lambda route: route.abort())
+    await page.route("**/*bounceexchange*", lambda route: route.abort())
+    await page.route("**/*integralas*", lambda route: route.abort())
+    await page.route("**/*IL_INSEARCH*", lambda route: route.abort())
+    
     # ---------------------------------------------------------------
     # STEP 1: Load the transfer portal list page
     # ---------------------------------------------------------------
@@ -398,12 +405,32 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     if not TEST_MODE:
         print(f"--- 2. Expanding {year} List (Clicking Load More) ---")
         
+        # 🔧 FIX: Initial overlay dismissal before starting clicks
+        await asyncio.sleep(3)
+        await page.evaluate("""
+            () => {
+                document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"], .bx-slab, .bx-overlay').forEach(el => el.remove());
+            }
+        """)
+        
         consecutive_failures = 0  # 🔧 FIX: track consecutive errors instead of breaking on first
         clicks_made = 0
         no_button_checks = 0
         
         for i in range(500):  # 🔧 FIX: increased from 300 to 500 for safety
             try:
+                # 🔧 FIX: Dismiss ad overlays/popups that block clicks
+                await page.evaluate("""
+                    () => {
+                        // Remove BounceX/Wunderkind overlay popups
+                        document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay').forEach(el => el.remove());
+                        // Remove IntelliSearch ad iframes
+                        document.querySelectorAll('.IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"]').forEach(el => el.remove());
+                        // Remove any generic modal backdrops
+                        document.querySelectorAll('.bx-slab, .bx-overlay').forEach(el => el.remove());
+                    }
+                """)
+                
                 # Scroll to bottom to trigger lazy loading
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(1)
@@ -411,7 +438,19 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
                 load_more = page.locator("text=Load More Players").or_(page.locator(".showmore_lnk"))
                 
                 if await load_more.count() > 0 and await load_more.first.is_visible():
-                    await load_more.first.click()
+                    # Try normal click first, fall back to JS click if overlay re-appears
+                    try:
+                        await load_more.first.click(timeout=5000)
+                    except Exception:
+                        # Overlays may respawn — use JS click to bypass
+                        await page.evaluate("""
+                            () => {
+                                const btn = document.querySelector('.transfer-group-loadMore') 
+                                    || document.querySelector('.showmore_lnk')
+                                    || [...document.querySelectorAll('button')].find(b => b.textContent.includes('Load More'));
+                                if (btn) btn.click();
+                            }
+                        """)
                     clicks_made += 1
                     consecutive_failures = 0  # 🔧 FIX: reset on success
                     no_button_checks = 0
@@ -451,13 +490,31 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
         # 🔧 FIX: Post-loop verification — make sure Load More is truly gone
         await asyncio.sleep(3)
         try:
+            # Dismiss any overlays before final check
+            await page.evaluate("""
+                () => {
+                    document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"], .bx-slab, .bx-overlay').forEach(el => el.remove());
+                }
+            """)
             final_check = page.locator("text=Load More Players").or_(page.locator(".showmore_lnk"))
             if await final_check.count() > 0 and await final_check.first.is_visible():
                 print(f"   ⚠️ {year}: Load More still visible after loop! Running cleanup...")
                 for _ in range(50):
                     try:
+                        # Dismiss overlays each iteration
+                        await page.evaluate("document.querySelectorAll('[id^=\"bx-campaign\"], .bxc, .IL_BASE, [id=\"IL_INSEARCH\"], [id=\"d_IL_INSEARCH\"]').forEach(el => el.remove())")
                         if await final_check.count() > 0 and await final_check.first.is_visible():
-                            await final_check.first.click()
+                            try:
+                                await final_check.first.click(timeout=5000)
+                            except Exception:
+                                await page.evaluate("""
+                                    () => {
+                                        const btn = document.querySelector('.transfer-group-loadMore') 
+                                            || document.querySelector('.showmore_lnk')
+                                            || [...document.querySelectorAll('button')].find(b => b.textContent.includes('Load More'));
+                                        if (btn) btn.click();
+                                    }
+                                """)
                             await asyncio.sleep(5)
                         else:
                             break
@@ -640,7 +697,7 @@ async def main():
     ]
     df = df.reindex(columns=cols)
     
-    output_filename = f"TEST_{OUTPUT_FILE}" if TEST_MODE else OUTPUT_FILE
+    output_filename = OUTPUT_FILE
     df.to_csv(output_filename, index=False)
     
     print("\n" + "="*80)
@@ -658,7 +715,7 @@ async def main():
     
     if all_failed:
         print(f"\n⚠️ Total failed: {len(all_failed)} profiles")
-        failed_file = f"TEST_failed_urls.csv" if TEST_MODE else "failed_urls.csv"
+        failed_file = f"failed_urls_{min(YEARS)}-{max(YEARS)}_{MODE_LABEL}_{datetime.now().strftime('%Y%m%d')}.csv"
         pd.DataFrame(all_failed).to_csv(failed_file, index=False)
         print(f"   Failed URLs saved to: {failed_file}")
     
