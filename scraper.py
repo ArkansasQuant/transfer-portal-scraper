@@ -24,7 +24,7 @@ else:
     YEARS = [2026, 2025, 2024]  # Default fallback
 
 CONCURRENCY_LIMIT = 4
-MAX_RETRIES = 5
+MAX_RETRIES = 2
 
 # ⭐ TEST MODE (controlled by GitHub Actions or defaults to True)
 TEST_MODE = os.getenv('TEST_MODE', 'true').lower() == 'true'
@@ -48,27 +48,20 @@ def extract_id_from_url(url):
 
 def normalize_player_url(url):
     """
-    Normalize 247Sports player URLs to prevent duplicate entries.
-    Handles: www vs non-www, http vs https, trailing slash, query params,
-    and /college-XXXXX/ or /junior-college-XXXXX/ suffixes.
-
-    Example:
-      https://www.247sports.com/player/reuben-unije-84039/college-257852/  →  https://247sports.com/player/reuben-unije-84039/
-      http://247sports.com/player/reuben-unije-84039  →  https://247sports.com/player/reuben-unije-84039/
+    Normalize 247Sports player URLs for deduplication.
+    Handles: www vs non-www, http vs https, query params.
+    KEEPS the /college-XXXXX/ suffix — this determines which transfer year's
+    data is displayed on the profile page.
     """
-    # Strip www, force https, remove query params
     url = url.split('?')[0].split('#')[0]
     url = url.replace('://www.', '://')
     url = url.replace('http://', 'https://')
-    
-    # Extract base player URL (strip /college-X/, /junior-college-X/, /high-school-X/)
-    match = re.match(r'(https://247sports\.com/player/[^/]+)', url)
-    if match:
-        return match.group(1) + '/'
+    if not url.endswith('/'):
+        url += '/'
     return url
 
 async def random_delay():
-    await asyncio.sleep(random.uniform(1.0, 2.0))
+    await asyncio.sleep(random.uniform(0.3, 0.5))
 
 def save_diagnostic_html(html, filename):
     """Save problematic HTML for debugging"""
@@ -266,9 +259,12 @@ def parse_profile(html, url, player_id, scraping_year):
                     data['Prospect Position Rank'] = rank_number
                     data['Prospect Position'] = bold_text
     
-    # ⭐ FALLBACK: Use scraping year if Transfer Year not found
-    if data['Transfer Year'] == "NA":
-        data['Transfer Year'] = str(scraping_year)
+    # ⭐ ALWAYS use scraping year as Transfer Year
+    # The profile page shows the MOST RECENT transfer ranking, so repeat portal
+    # entrants (e.g., player who transferred in both 2025 and 2026) would get
+    # their year overwritten to the latest one, causing dedup to drop them from
+    # the earlier year. The list page we scraped from is the authoritative source.
+    data['Transfer Year'] = str(scraping_year)
 
     return data
 
@@ -302,7 +298,7 @@ async def scrape_profile(context, url, sem, failed_urls, scraping_year, diagnost
             except Exception as e:
                 await page.close()
                 if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2)
                 else:
                     failed_urls.append({'url': url, 'reason': str(e), 'year': scraping_year})
                     return None
@@ -421,46 +417,43 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     if not TEST_MODE:
         print(f"--- 2. Expanding {year} List (Clicking Load More) ---")
         
-        # 🔧 FIX: Initial overlay dismissal before starting clicks
-        await asyncio.sleep(3)
+        # Initial overlay dismissal
+        await asyncio.sleep(2)
         await page.evaluate("""
             () => {
                 document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"], .bx-slab, .bx-overlay').forEach(el => el.remove());
             }
         """)
         
-        consecutive_failures = 0  # 🔧 FIX: track consecutive errors instead of breaking on first
+        consecutive_failures = 0
         clicks_made = 0
         no_button_checks = 0
+        insufficient_retries = 0  # Cap retries when we think list is short
         
-        for i in range(500):  # 🔧 FIX: increased from 300 to 500 for safety
+        for i in range(500):
             try:
-                # 🔧 FIX: Dismiss ad overlays/popups that block clicks
-                await page.evaluate("""
-                    () => {
-                        // Remove BounceX/Wunderkind overlay popups
-                        document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay').forEach(el => el.remove());
-                        // Remove IntelliSearch ad iframes
-                        document.querySelectorAll('.IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"]').forEach(el => el.remove());
-                        // Remove any generic modal backdrops
-                        document.querySelectorAll('.bx-slab, .bx-overlay').forEach(el => el.remove());
-                    }
-                """)
+                # Dismiss overlays every 10 iterations
+                if i % 10 == 0:
+                    await page.evaluate("""
+                        () => {
+                            document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"], .bx-slab, .bx-overlay').forEach(el => el.remove());
+                        }
+                    """)
                 
-                # Scroll to bottom to trigger lazy loading
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1)
+                # Scroll to bottom every 3rd iteration to trigger lazy loading
+                if i % 3 == 0:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 
                 load_more = page.locator("text=Load More Players").or_(page.locator(".showmore_lnk"))
                 
                 if await load_more.count() > 0 and await load_more.first.is_visible():
-                    # Try normal click first, fall back to JS click if overlay re-appears
                     try:
                         await load_more.first.click(timeout=5000)
                     except Exception:
-                        # Overlays may respawn — use JS click to bypass
+                        # Overlay may have respawned — dismiss and JS click
                         await page.evaluate("""
                             () => {
+                                document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .bx-slab, .bx-overlay').forEach(el => el.remove());
                                 const btn = document.querySelector('.transfer-group-loadMore') 
                                     || document.querySelector('.showmore_lnk')
                                     || [...document.querySelectorAll('button')].find(b => b.textContent.includes('Load More'));
@@ -468,11 +461,10 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
                             }
                         """)
                     clicks_made += 1
-                    consecutive_failures = 0  # 🔧 FIX: reset on success
+                    consecutive_failures = 0
                     no_button_checks = 0
-                    await asyncio.sleep(5)  # 🔧 FIX: increased from 4 to 5
+                    await asyncio.sleep(2.5)
                     
-                    # Progress logging every 25 clicks
                     if clicks_made % 25 == 0:
                         try:
                             current_count = await page.eval_on_selector_all(
@@ -483,30 +475,44 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
                         except:
                             print(f"   📈 {year}: {clicks_made} clicks")
                 else:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1.5)
                     no_button_checks += 1
                     
-                    # 🔧 FIX: require 3 consecutive "no button" checks before declaring done
-                    # Prevents premature exit when button temporarily disappears during content load
-                    if no_button_checks >= 3:
-                        print(f"   ✅ {year}: Full list loaded ({clicks_made} total clicks)")
+                    # Before declaring done, validate we have enough players
+                    if no_button_checks >= 5:
+                        try:
+                            current_links = await page.eval_on_selector_all(
+                                "a[href*='/player/']",
+                                "elements => elements.length"
+                            )
+                        except:
+                            current_links = 0
+                        
+                        # If we have an expected total and are significantly short, try scrolling + waiting
+                        if expected_total and current_links < expected_total * 0.9 and insufficient_retries < 5:
+                            insufficient_retries += 1
+                            print(f"   ⚠️ {year}: Only ~{current_links} links but expected ~{expected_total}. Retry {insufficient_retries}/5...")
+                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            await asyncio.sleep(3)
+                            no_button_checks = 0  # Reset and keep trying
+                            continue
+                        
+                        print(f"   ✅ {year}: Full list loaded ({clicks_made} clicks, ~{current_links} links)")
                         break
                         
             except Exception as e:
                 consecutive_failures += 1
                 print(f"   ⚠️ Load More error ({consecutive_failures}/10): {e}")
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
                 
-                # 🔧 FIX: only break after 10 CONSECUTIVE failures, not 1
                 if consecutive_failures >= 10:
                     print(f"   ❌ {year}: Too many consecutive failures after {clicks_made} clicks")
                     break
-                continue  # 🔧 FIX: was `break` — this is the CRITICAL change
+                continue
         
-        # 🔧 FIX: Post-loop verification — make sure Load More is truly gone
-        await asyncio.sleep(3)
+        # Post-loop verification — make sure Load More is truly gone
+        await asyncio.sleep(2)
         try:
-            # Dismiss any overlays before final check
             await page.evaluate("""
                 () => {
                     document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"], .bx-slab, .bx-overlay').forEach(el => el.remove());
@@ -517,7 +523,6 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
                 print(f"   ⚠️ {year}: Load More still visible after loop! Running cleanup...")
                 for _ in range(50):
                     try:
-                        # Dismiss overlays each iteration
                         await page.evaluate("document.querySelectorAll('[id^=\"bx-campaign\"], .bxc, .IL_BASE, [id=\"IL_INSEARCH\"], [id=\"d_IL_INSEARCH\"]').forEach(el => el.remove())")
                         if await final_check.count() > 0 and await final_check.first.is_visible():
                             try:
@@ -531,7 +536,7 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
                                         if (btn) btn.click();
                                     }
                                 """)
-                            await asyncio.sleep(5)
+                            await asyncio.sleep(2.5)
                         else:
                             break
                     except:
@@ -541,7 +546,7 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
             pass
     else:
         print(f"--- 2. TEST MODE: Loading only first page of {year} ---")
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
     
     # ---------------------------------------------------------------
     # STEP 3: Extract player profile links
