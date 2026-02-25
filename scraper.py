@@ -382,7 +382,7 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     print(f"--- 1. Loading {year} Transfer Portal List ---")
     await page.goto(base_url, timeout=120000, wait_until="domcontentloaded")
     try:
-        await page.wait_for_selector(".rankings-page__name-link", timeout=30000)
+        await page.wait_for_selector(".rankings-page__name-link, li.transfer-player h3 a", timeout=30000)
     except:
         pass
 
@@ -553,39 +553,47 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     # ---------------------------------------------------------------
     print(f"--- 3. Extracting {year} Profile Links ---")
     
-    # Use the specific list-item selector first (only matches transfer portal list entries)
-    links_primary = await page.eval_on_selector_all(
+    # Collect from ALL selectors and combine — different portal years use different templates:
+    #   - 2025/2026: .rankings-page__name-link
+    #   - 2024 and earlier: li.transfer-player h3 a (no .rankings-page__name-link class)
+    all_links = []
+    
+    for selector in [
         ".rankings-page__name-link",
-        "elements => elements.map(e => e.href)"
-    )
+        "li.transfer-player h3 a",
+        ".rankings-page__list-item a[href*='/player/']",
+        "li.transfer-player a[href*='/player/']",
+    ]:
+        try:
+            found = await page.eval_on_selector_all(
+                selector,
+                "elements => elements.map(e => e.href)"
+            )
+            if found:
+                print(f"   📎 '{selector}' → {len(found)} links")
+                all_links.extend(found)
+        except:
+            pass
     
-    # Fallback: scope to list container to avoid sidebar/news/trending links
-    if len(links_primary) == 0:
-        links_primary = await page.eval_on_selector_all(
-            ".rankings-page__list-item a[href*='/player/']",
-            "elements => elements.map(e => e.href)"
-        )
-    
-    # Last resort: broad selector (but likely to include non-list links)
-    if len(links_primary) == 0:
-        links_primary = await page.eval_on_selector_all(
+    # Last resort if nothing matched above
+    if len(all_links) == 0:
+        all_links = await page.eval_on_selector_all(
             "a[href*='/player/']",
             "elements => elements.map(e => e.href)"
         )
+        print(f"   📎 broad fallback → {len(all_links)} links")
     
-    all_links = links_primary
-    
-    # 🔧 FIX: Normalize URLs before deduplicating (strips /college-XXXXX/ suffix)
-    unique_links = list(set(
+    # Normalize and deduplicate
+    unique_links = list(dict.fromkeys(
         normalize_player_url(l)
         for l in all_links
         if "247sports.com/player/" in l
     ))
     
-    # 🔧 FIX: Count visible list items for validation
+    # Count visible list items for validation
     try:
         visible_items = await page.eval_on_selector_all(
-            ".rankings-page__list-item",
+            ".rankings-page__list-item, li.transfer-player",
             "elements => elements.length"
         )
         print(f"   📊 {year}: Visible list items on page: {visible_items}")
