@@ -11,6 +11,7 @@ from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
 BASE_URL_TEMPLATE = "https://247sports.com/season/{year}-football/transferportalpositionranking/"
+TOP_URL_TEMPLATE = "https://247sports.com/season/{year}-football/TransferPortalTop/"
 
 # ⭐ YEARS TO SCRAPE (controlled by GitHub Actions dropdown or defaults to 2024-2026)
 YEAR_RANGE = os.getenv('YEAR_RANGE', '2024-2026')
@@ -20,6 +21,8 @@ elif YEAR_RANGE == '2024-2026':
     YEARS = [2026, 2025, 2024]
 elif YEAR_RANGE == 'all':
     YEARS = [2026, 2025, 2024, 2023, 2022, 2021]
+elif YEAR_RANGE in ['2021', '2022', '2023', '2024', '2025', '2026']:
+    YEARS = [int(YEAR_RANGE)]
 else:
     YEARS = [2026, 2025, 2024]  # Default fallback
 
@@ -364,8 +367,6 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     print(f"📅 SCRAPING YEAR: {year}")
     print("="*80)
     
-    base_url = BASE_URL_TEMPLATE.format(year=year)
-    
     browser = await p.chromium.launch(headless=True)
     context = await browser.new_context(user_agent=ua.random, viewport={'width': 1920, 'height': 1080})
     page = await context.new_page()
@@ -377,9 +378,41 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     await page.route("**/*IL_INSEARCH*", lambda route: route.abort())
     
     # ---------------------------------------------------------------
-    # STEP 1: Load the transfer portal list page
+    # STEP 1a: Load TransferPortalTop page (top ~247 players, no Load More needed)
     # ---------------------------------------------------------------
-    print(f"--- 1. Loading {year} Transfer Portal List ---")
+    top_url = TOP_URL_TEMPLATE.format(year=year)
+    print(f"--- 1a. Loading {year} TransferPortalTop (top ~247) ---")
+    top_links = []
+    try:
+        await page.goto(top_url, timeout=120000, wait_until="domcontentloaded")
+        await page.wait_for_selector("li.transfer-player h3 a, .rankings-page__name-link", timeout=30000)
+        await asyncio.sleep(2)
+        
+        for selector in [
+            "li.transfer-player h3 a",
+            ".rankings-page__name-link",
+        ]:
+            try:
+                found = await page.eval_on_selector_all(
+                    selector,
+                    "elements => elements.map(e => e.href)"
+                )
+                if found:
+                    print(f"   📎 Top page '{selector}' → {len(found)} links")
+                    top_links.extend(found)
+            except:
+                pass
+        
+        top_links = [normalize_player_url(l) for l in top_links if "247sports.com/player/" in l]
+        print(f"   ✅ {year}: TransferPortalTop captured {len(top_links)} unique links")
+    except Exception as e:
+        print(f"   ⚠️ {year}: TransferPortalTop failed: {e}")
+    
+    # ---------------------------------------------------------------
+    # STEP 1b: Load the full transfer portal list page (with Load More)
+    # ---------------------------------------------------------------
+    base_url = BASE_URL_TEMPLATE.format(year=year)
+    print(f"--- 1b. Loading {year} Transfer Portal Full List ---")
     await page.goto(base_url, timeout=120000, wait_until="domcontentloaded")
     try:
         await page.wait_for_selector(".rankings-page__name-link, li.transfer-player h3 a", timeout=30000)
@@ -583,10 +616,18 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
         )
         print(f"   📎 broad fallback → {len(all_links)} links")
     
-    # Normalize and deduplicate
+    # Merge TransferPortalTop links FIRST (top ~247 with correct rankings)
+    # These go first so dict.fromkeys preserves them over positionranking duplicates
+    merged_links = []
+    if top_links:
+        merged_links.extend(top_links)
+        print(f"   📎 {len(top_links)} links from TransferPortalTop (priority)")
+    merged_links.extend(all_links)
+    
+    # Normalize and deduplicate (dict.fromkeys preserves first occurrence order)
     unique_links = list(dict.fromkeys(
         normalize_player_url(l)
-        for l in all_links
+        for l in merged_links
         if "247sports.com/player/" in l
     ))
     
