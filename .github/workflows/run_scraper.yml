@@ -11,6 +11,12 @@ on:
           - '2024-2026'
           - '2021-2023'
           - 'all'
+          - '2026'
+          - '2025'
+          - '2024'
+          - '2023'
+          - '2022'
+          - '2021'
       test_mode:
         description: 'Test Mode (true = 50 players, false = full scrape)'
         required: false
