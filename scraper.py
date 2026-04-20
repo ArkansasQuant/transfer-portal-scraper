@@ -124,23 +124,18 @@ def parse_profile(html, url, player_id, scraping_year):
             if match: data['EXP'] = match.group(1).strip()
 
     # --- TEAM LOGIC ---
-    # Current Team (Origination)
+    # Current Team (Origination) — from the historical team-info section
     data['Team'] = "NA"
-    team_header = soup.select_one('.team-block header h2')
-    if not team_header:
-        team_header = soup.select_one('.team-info-section header h2')
+    team_header = soup.select_one('.team-info-section header h2')
     if team_header:
         data['Team'] = team_header.text.strip()
     
-    # Transfer Destination Team — try multiple selectors
+    # Transfer Destination Team — from the commit banner
     data['Transfer Team Name'] = "NA"
-    # Primary: team-block header (shows current/transfer destination team)
-    team_block = soup.select_one('.team-and-crystal-ball .team-block header h2')
-    if not team_block:
-        team_block = soup.select_one('.team-block header h2')
-    if team_block:
-        team_text = team_block.text.strip()
-        if team_text:
+    commit_banner = soup.select_one('.commit-banner span')
+    if commit_banner:
+        team_text = commit_banner.text.strip()
+        if team_text and team_text != "Commit":
             data['Transfer Team Name'] = team_text
     # Fallback: commit-banner
     if data['Transfer Team Name'] == "NA":
