@@ -40,6 +40,11 @@ OUTPUT_FILE = f"transfer_portal_{min(YEARS)}-{max(YEARS)}_{MODE_LABEL}_{datetime
 DIAGNOSTICS_MODE = True
 MAX_DIAGNOSTIC_SAMPLES = 5  # Save up to 5 problem HTML files per year
 
+# ⭐ LOAD MORE SAFETY CAPS
+MAX_LOAD_MORE_ITERATIONS = 1000   # Hard safety cap
+MAX_STALLED_ITERATIONS = 25       # Exit after this many iterations with no new links AND no visible button
+CLICK_WAIT_SECONDS = 2.5          # How long to wait after a successful click
+
 # --- UTILS ---
 def clean_text(text):
     if not text: return None
@@ -81,8 +86,8 @@ def save_diagnostic_html(html, filename):
 # --- PARSING LOGIC ---
 def parse_profile(html, url, player_id, scraping_year):
     """
-    Parse player profile HTML
-    scraping_year: The year we're scraping from (2026, 2025, etc.) - used as fallback
+    Parse player profile HTML.
+    scraping_year: The year we're scraping from - used as Transfer Year.
     """
     soup = BeautifulSoup(html, 'lxml')
     data = {}
@@ -123,7 +128,7 @@ def parse_profile(html, url, player_id, scraping_year):
             match = re.search(r'(?:Class|Exp)[:\s]*(.*)', text, re.IGNORECASE)
             if match: data['EXP'] = match.group(1).strip()
 
-    # --- TEAM LOGIC ---
+    # --- TEAM LOGIC (RESTORED CORRECT SELECTORS) ---
     # Current Team (Origination) — from the historical team-info section
     data['Team'] = "NA"
     team_header = soup.select_one('.team-info-section header h2')
@@ -137,13 +142,6 @@ def parse_profile(html, url, player_id, scraping_year):
         team_text = commit_banner.text.strip()
         if team_text and team_text != "Commit":
             data['Transfer Team Name'] = team_text
-    # Fallback: commit-banner
-    if data['Transfer Team Name'] == "NA":
-        commit_banner = soup.select_one('.commit-banner span')
-        if commit_banner:
-            team_text = commit_banner.text.strip()
-            if team_text and team_text != "Commit":
-                data['Transfer Team Name'] = team_text
     
     # --- PARSE TRANSFER AND PROSPECT BY TITLE ---
     data['Transfer Stars'] = "0"
@@ -171,41 +169,33 @@ def parse_profile(html, url, player_id, scraping_year):
         
         # TRANSFER SECTION
         if "Transfer" in title:
-            # Stars
             stars = section.select('span.icon-starsolid.yellow')
             if stars:
                 data['Transfer Stars'] = str(min(len(stars), 5))
             
-            # Rating and Year (extract year from rating block)
             rating_block = section.select_one('.rank-block')
             if rating_block:
                 rating_text = rating_block.get_text(strip=True)
-                # Extract rating (number before year)
                 match = re.search(r'^(\d+)', rating_text)
                 if match:
                     data['Transfer Rating'] = match.group(1)
-                # Extract year from (YYYY) format
                 year_match = re.search(r'\((\d{4})\)', rating_text)
                 if year_match:
                     data['Transfer Year'] = year_match.group(1)
             
-            # Ranks and Position
             for li in section.select('li'):
                 bold_tag = li.find('b')
                 if not bold_tag:
                     continue
-                
                 bold_text = bold_tag.get_text(strip=True).upper()
                 strong_tag = li.find('strong')
                 if not strong_tag:
                     continue
-                
                 rank_number = strong_tag.get_text(strip=True)
                 
                 if 'OVR' in bold_text:
                     data['Transfer Overall Rank'] = rank_number
                 elif data['Transfer Position Rank'] == 'NA':
-                    # This is the position rank
                     data['Transfer Position Rank'] = rank_number
                     data['Transfer Position'] = bold_text
         
@@ -213,7 +203,6 @@ def parse_profile(html, url, player_id, scraping_year):
         elif title == "247Sports" or "JUCO" in title:
             is_juco = "JUCO" in title
             
-            # Stars - check for JUCO
             if is_juco:
                 data['Prospect Stars'] = "JUCO"
             else:
@@ -221,7 +210,6 @@ def parse_profile(html, url, player_id, scraping_year):
                 if stars:
                     data['Prospect Stars'] = str(min(len(stars), 5))
             
-            # Rating
             rating_block = section.select_one('.rank-block')
             if rating_block:
                 rating_text = rating_block.get_text(strip=True)
@@ -229,39 +217,29 @@ def parse_profile(html, url, player_id, scraping_year):
                 if match:
                     data['Prospect Rating'] = match.group(1)
             
-            # Ranks and Position
             for li in section.select('li'):
                 bold_tag = li.find('b')
                 if not bold_tag:
                     continue
-                
                 bold_text = bold_tag.get_text(strip=True).upper()
                 strong_tag = li.find('strong')
                 if not strong_tag:
                     continue
-                
                 rank_number = strong_tag.get_text(strip=True)
                 
-                # Check link URL to distinguish position vs state ranks
                 link_tag = li.find('a')
                 link_url = link_tag.get('href', '') if link_tag else ''
                 
-                # National Rank
                 if 'NATL' in bold_text or 'NATIONAL' in bold_text:
                     data['Prospect National Rank'] = rank_number
-                # State rank - skip it
                 elif 'State=' in link_url:
                     continue
-                # Position Rank - check URL for Position= or positionKey=
                 elif ('Position=' in link_url or 'positionKey=' in link_url) and data['Prospect Position Rank'] == 'NA':
                     data['Prospect Position Rank'] = rank_number
                     data['Prospect Position'] = bold_text
     
-    # ⭐ ALWAYS use scraping year as Transfer Year
-    # The profile page shows the MOST RECENT transfer ranking, so repeat portal
-    # entrants (e.g., player who transferred in both 2025 and 2026) would get
-    # their year overwritten to the latest one, causing dedup to drop them from
-    # the earlier year. The list page we scraped from is the authoritative source.
+    # Always use scraping year — profile page shows MOST RECENT transfer only,
+    # so a player who appears on multiple years' portal lists needs the list year, not the profile year.
     data['Transfer Year'] = str(scraping_year)
 
     return data
@@ -286,7 +264,6 @@ async def scrape_profile(context, url, sem, failed_urls, scraping_year, diagnost
                 data = parse_profile(content, url, player_id, scraping_year)
                 data['URL'] = url
                 
-                # Track diagnostics
                 if DIAGNOSTICS_MODE:
                     track_diagnostics(data, content, scraping_year, diagnostic_tracker)
                 
@@ -303,8 +280,6 @@ async def scrape_profile(context, url, sem, failed_urls, scraping_year, diagnost
 
 def track_diagnostics(data, html, year, tracker):
     """Track field completeness and save problematic HTML samples"""
-    
-    # Initialize year tracker
     if year not in tracker['by_year']:
         tracker['by_year'][year] = {
             'total': 0,
@@ -314,7 +289,6 @@ def track_diagnostics(data, html, year, tracker):
     
     tracker['by_year'][year]['total'] += 1
     
-    # Track each field
     fields_to_track = [
         'Transfer Stars', 'Transfer Rating', 'Transfer Year', 'Transfer Overall Rank',
         'Transfer Position Rank', 'Transfer Position', 'Transfer Team Name',
@@ -326,11 +300,9 @@ def track_diagnostics(data, html, year, tracker):
     missing_fields = []
     
     for field in fields_to_track:
-        # Initialize field counter
         if field not in tracker['by_year'][year]['fields']:
             tracker['by_year'][year]['fields'][field] = {'filled': 0, 'na': 0}
         
-        # Count filled vs NA
         value = data.get(field, 'NA')
         if value == 'NA' or value == '0':
             tracker['by_year'][year]['fields'][field]['na'] += 1
@@ -339,7 +311,6 @@ def track_diagnostics(data, html, year, tracker):
         else:
             tracker['by_year'][year]['fields'][field]['filled'] += 1
     
-    # Save sample HTML if this player has issues
     if has_issues and len(tracker['by_year'][year]['problem_samples']) < MAX_DIAGNOSTIC_SAMPLES:
         player_id = data.get('247 ID', 'unknown')
         player_name = data.get('Player Name', 'unknown')
@@ -355,7 +326,142 @@ def track_diagnostics(data, html, year, tracker):
                 'html_file': filename
             })
 
-# --- IMPROVED scrape_year WITH ALL FIXES ---
+# --- OVERLAY CLEANUP HELPER ---
+OVERLAY_CLEANUP_JS = """
+() => {
+    const selectors = [
+        '[id^="bx-campaign"]',
+        '.bxc.bx-type-overlay',
+        '.bxc',
+        '.IL_BASE',
+        '[id="IL_INSEARCH"]',
+        '[id="d_IL_INSEARCH"]',
+        '.bx-slab',
+        '.bx-overlay',
+        '[id*="bouncex"]',
+        '[class*="bouncex"]'
+    ];
+    selectors.forEach(sel => {
+        try {
+            document.querySelectorAll(sel).forEach(el => el.remove());
+        } catch(e) {}
+    });
+}
+"""
+
+async def get_link_count(page):
+    """Count player profile links currently on the page."""
+    try:
+        return await page.eval_on_selector_all(
+            "a[href*='/player/']",
+            "elements => elements.length"
+        )
+    except:
+        return 0
+
+async def try_click_load_more(page):
+    """
+    Try multiple strategies to click the Load More button.
+    Returns True if a click was attempted successfully.
+    """
+    # Strategy 1: Playwright locator click
+    try:
+        load_more = page.locator("text=Load More Players").or_(page.locator(".showmore_lnk"))
+        if await load_more.count() > 0:
+            try:
+                await load_more.first.scroll_into_view_if_needed(timeout=3000)
+            except:
+                pass
+            try:
+                await load_more.first.click(timeout=5000)
+                return True
+            except:
+                # Strategy 2: Force click
+                try:
+                    await load_more.first.click(timeout=5000, force=True)
+                    return True
+                except:
+                    pass
+    except:
+        pass
+    
+    # Strategy 3: Direct JS click — most robust for overlay interference
+    try:
+        clicked = await page.evaluate("""
+            () => {
+                const candidates = [
+                    ...document.querySelectorAll('.transfer-group-loadMore'),
+                    ...document.querySelectorAll('.showmore_lnk'),
+                    ...[...document.querySelectorAll('button, a')].filter(el => 
+                        el.textContent && el.textContent.trim().includes('Load More'))
+                ];
+                for (const btn of candidates) {
+                    if (btn.offsetParent !== null || btn.getBoundingClientRect().height > 0) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                // Last resort — click even if hidden
+                if (candidates.length > 0) {
+                    candidates[0].click();
+                    return true;
+                }
+                return false;
+            }
+        """)
+        return clicked
+    except:
+        return False
+
+async def load_more_button_exists(page):
+    """Check if a Load More button exists in the DOM (regardless of visibility)."""
+    try:
+        count = await page.evaluate("""
+            () => {
+                const candidates = [
+                    ...document.querySelectorAll('.transfer-group-loadMore'),
+                    ...document.querySelectorAll('.showmore_lnk'),
+                    ...[...document.querySelectorAll('button, a')].filter(el => 
+                        el.textContent && el.textContent.trim().includes('Load More'))
+                ];
+                return candidates.length;
+            }
+        """)
+        return count > 0
+    except:
+        return False
+
+async def extract_expected_total(page):
+    """
+    Extract expected total player count from the page.
+    ONLY looks at elements likely to contain the count — never grabs year numbers from h1.
+    """
+    # Look for explicit total indicators only
+    selectors_to_try = [
+        ".rankings-page__header .total",
+        ".result-count",
+        "[class*='total-count']",
+        "[class*='player-count']",
+    ]
+    
+    for selector in selectors_to_try:
+        try:
+            el = page.locator(selector).first
+            if await el.count() > 0:
+                text = await el.text_content()
+                # Look for numbers that aren't years (exclude 19xx/20xx)
+                matches = re.findall(r'\b(\d{3,5})\b', text or '')
+                for m in matches:
+                    n = int(m)
+                    # Filter: must be at least 100, and not a year
+                    if n >= 100 and not (1900 <= n <= 2099):
+                        return n
+        except:
+            continue
+    
+    return None
+
+# --- SCRAPE YEAR ---
 async def scrape_year(year, p, ua, diagnostic_tracker):
     """Scrape all players for a specific year"""
     print("\n" + "="*80)
@@ -366,14 +472,14 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     context = await browser.new_context(user_agent=ua.random, viewport={'width': 1920, 'height': 1080})
     page = await context.new_page()
     
-    # 🔧 FIX: Block ad/overlay scripts that intercept clicks
+    # Block ad/overlay scripts that intercept clicks
     await page.route("**/*bouncex*", lambda route: route.abort())
     await page.route("**/*bounceexchange*", lambda route: route.abort())
     await page.route("**/*integralas*", lambda route: route.abort())
     await page.route("**/*IL_INSEARCH*", lambda route: route.abort())
     
     # ---------------------------------------------------------------
-    # STEP 1a: Load TransferPortalTop page (top ~247 players, no Load More needed)
+    # STEP 1a: Load TransferPortalTop page (top ~247 players)
     # ---------------------------------------------------------------
     top_url = TOP_URL_TEMPLATE.format(year=year)
     print(f"--- 1a. Loading {year} TransferPortalTop (top ~247) ---")
@@ -399,12 +505,13 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
                 pass
         
         top_links = [normalize_player_url(l) for l in top_links if "247sports.com/player/" in l]
+        top_links = list(dict.fromkeys(top_links))  # Dedupe, preserve order
         print(f"   ✅ {year}: TransferPortalTop captured {len(top_links)} unique links")
     except Exception as e:
         print(f"   ⚠️ {year}: TransferPortalTop failed: {e}")
     
     # ---------------------------------------------------------------
-    # STEP 1b: Load the full transfer portal list page (with Load More)
+    # STEP 1b: Load the full transfer portal list page
     # ---------------------------------------------------------------
     base_url = BASE_URL_TEMPLATE.format(year=year)
     print(f"--- 1b. Loading {year} Transfer Portal Full List ---")
@@ -413,163 +520,110 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
         await page.wait_for_selector(".rankings-page__name-link, li.transfer-player h3 a", timeout=30000)
     except:
         pass
-
-    # 🔧 FIX: Capture expected total from page header
-    expected_total = None
-    try:
-        for selector in [
-            ".rankings-page__header .total",
-            ".result-count",
-            ".rankings-page__header",
-            "h1",
-        ]:
-            try:
-                el = page.locator(selector).first
-                if await el.count() > 0:
-                    text = await el.text_content()
-                    match = re.search(r'(\d{3,})', text)  # Look for 3+ digit number
-                    if match:
-                        expected_total = int(match.group(1))
-                        print(f"   📊 {year}: Page reports {expected_total} total players")
-                        break
-            except:
-                continue
-        if expected_total is None:
-            print(f"   ⚠️ {year}: Could not determine expected player count from page")
-    except:
-        pass
+    
+    # Capture expected total (from explicit count elements only)
+    expected_total = await extract_expected_total(page)
+    if expected_total:
+        print(f"   📊 {year}: Page reports {expected_total} total players")
+    else:
+        print(f"   ℹ️ {year}: No explicit total count on page (will rely on link growth tracking)")
 
     # ---------------------------------------------------------------
-    # STEP 2: Expand full list by clicking "Load More"
+    # STEP 2: Expand full list with ROBUST Load More loop
     # ---------------------------------------------------------------
     if not TEST_MODE:
-        print(f"--- 2. Expanding {year} List (Clicking Load More) ---")
+        print(f"--- 2. Expanding {year} List (Robust Load More) ---")
         
-        # Initial overlay dismissal
+        # Initial overlay dismissal and scroll
         await asyncio.sleep(2)
-        await page.evaluate("""
-            () => {
-                document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"], .bx-slab, .bx-overlay').forEach(el => el.remove());
-            }
-        """)
+        await page.evaluate(OVERLAY_CLEANUP_JS)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(1)
         
-        consecutive_failures = 0
+        last_link_count = await get_link_count(page)
+        print(f"   📊 {year}: Starting link count: {last_link_count}")
+        
+        stalled_count = 0           # Iterations with no growth
         clicks_made = 0
-        no_button_checks = 0
-        insufficient_retries = 0  # Cap retries when we think list is short
+        clicks_attempted = 0
+        consecutive_click_failures = 0
         
-        for i in range(500):
+        for i in range(MAX_LOAD_MORE_ITERATIONS):
+            # Dismiss overlays every iteration (cheap, prevents click interception)
             try:
-                # Dismiss overlays every 10 iterations
-                if i % 10 == 0:
-                    await page.evaluate("""
-                        () => {
-                            document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"], .bx-slab, .bx-overlay').forEach(el => el.remove());
-                        }
-                    """)
-                
-                # Scroll to bottom every 3rd iteration to trigger lazy loading
-                if i % 3 == 0:
+                await page.evaluate(OVERLAY_CLEANUP_JS)
+            except:
+                pass
+            
+            # Scroll to bottom every few iterations to trigger lazy loading
+            if i % 2 == 0:
+                try:
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                except:
+                    pass
+            
+            # Check if Load More button exists in DOM (not just visible)
+            button_exists = await load_more_button_exists(page)
+            
+            if button_exists:
+                clicked = await try_click_load_more(page)
+                clicks_attempted += 1
                 
-                load_more = page.locator("text=Load More Players").or_(page.locator(".showmore_lnk"))
-                
-                if await load_more.count() > 0 and await load_more.first.is_visible():
-                    try:
-                        await load_more.first.click(timeout=5000)
-                    except Exception:
-                        # Overlay may have respawned — dismiss and JS click
-                        await page.evaluate("""
-                            () => {
-                                document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .bx-slab, .bx-overlay').forEach(el => el.remove());
-                                const btn = document.querySelector('.transfer-group-loadMore') 
-                                    || document.querySelector('.showmore_lnk')
-                                    || [...document.querySelectorAll('button')].find(b => b.textContent.includes('Load More'));
-                                if (btn) btn.click();
-                            }
-                        """)
+                if clicked:
                     clicks_made += 1
-                    consecutive_failures = 0
-                    no_button_checks = 0
-                    await asyncio.sleep(2.5)
-                    
-                    if clicks_made % 25 == 0:
-                        try:
-                            current_count = await page.eval_on_selector_all(
-                                "a[href*='/player/']",
-                                "elements => elements.length"
-                            )
-                            print(f"   📈 {year}: {clicks_made} clicks, ~{current_count} links so far")
-                        except:
-                            print(f"   📈 {year}: {clicks_made} clicks")
+                    consecutive_click_failures = 0
+                    await asyncio.sleep(CLICK_WAIT_SECONDS)
                 else:
+                    consecutive_click_failures += 1
                     await asyncio.sleep(1.5)
-                    no_button_checks += 1
                     
-                    # Before declaring done, validate we have enough players
-                    if no_button_checks >= 5:
-                        try:
-                            current_links = await page.eval_on_selector_all(
-                                "a[href*='/player/']",
-                                "elements => elements.length"
-                            )
-                        except:
-                            current_links = 0
-                        
-                        # If we have an expected total and are significantly short, try scrolling + waiting
-                        if expected_total and current_links < expected_total * 0.9 and insufficient_retries < 5:
-                            insufficient_retries += 1
-                            print(f"   ⚠️ {year}: Only ~{current_links} links but expected ~{expected_total}. Retry {insufficient_retries}/5...")
-                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            await asyncio.sleep(3)
-                            no_button_checks = 0  # Reset and keep trying
-                            continue
-                        
-                        print(f"   ✅ {year}: Full list loaded ({clicks_made} clicks, ~{current_links} links)")
-                        break
-                        
-            except Exception as e:
-                consecutive_failures += 1
-                print(f"   ⚠️ Load More error ({consecutive_failures}/10): {e}")
-                await asyncio.sleep(2)
-                
-                if consecutive_failures >= 10:
-                    print(f"   ❌ {year}: Too many consecutive failures after {clicks_made} clicks")
-                    break
-                continue
+                    # If click failures pile up, try reloading the page section
+                    if consecutive_click_failures >= 10:
+                        print(f"   ⚠️ {year}: {consecutive_click_failures} consecutive click failures, forcing scroll")
+                        await page.evaluate("window.scrollTo(0, 0)")
+                        await asyncio.sleep(1)
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(2)
+                        consecutive_click_failures = 0
+            else:
+                # No button — might be truly done, or button temporarily hidden
+                await asyncio.sleep(1.5)
+            
+            # Check if link count has grown
+            current_link_count = await get_link_count(page)
+            
+            if current_link_count > last_link_count:
+                stalled_count = 0
+                last_link_count = current_link_count
+            else:
+                stalled_count += 1
+            
+            # Progress logging every 10 clicks or every 50 iterations
+            if (clicks_made > 0 and clicks_made % 10 == 0 and clicks_attempted != clicks_made - 1) or (i > 0 and i % 50 == 0):
+                print(f"   📈 {year}: iter={i}, clicks={clicks_made}, links={current_link_count}, stalled={stalled_count}")
+            
+            # EXIT CONDITIONS:
+            # 1. Button gone AND links haven't grown for MAX_STALLED_ITERATIONS
+            if not button_exists and stalled_count >= MAX_STALLED_ITERATIONS:
+                print(f"   ✅ {year}: Load More complete (no button, {stalled_count} stalled iterations)")
+                print(f"      Total: {clicks_made} clicks, {current_link_count} links found")
+                break
+            
+            # 2. If we've stalled for a VERY long time even with button present, bail
+            if stalled_count >= MAX_STALLED_ITERATIONS * 2:
+                print(f"   ⚠️ {year}: Stalled for {stalled_count} iterations despite button present. Exiting.")
+                print(f"      Total: {clicks_made} clicks, {current_link_count} links found")
+                break
+        else:
+            # Hit the iteration cap
+            print(f"   ⚠️ {year}: Hit max iteration cap ({MAX_LOAD_MORE_ITERATIONS})")
+            print(f"      Total: {clicks_made} clicks, {last_link_count} links found")
         
-        # Post-loop verification — make sure Load More is truly gone
-        await asyncio.sleep(2)
+        # Final overlay cleanup and one more scroll to capture anything lazy-loaded
         try:
-            await page.evaluate("""
-                () => {
-                    document.querySelectorAll('[id^="bx-campaign"], .bxc.bx-type-overlay, .IL_BASE, [id="IL_INSEARCH"], [id="d_IL_INSEARCH"], .bx-slab, .bx-overlay').forEach(el => el.remove());
-                }
-            """)
-            final_check = page.locator("text=Load More Players").or_(page.locator(".showmore_lnk"))
-            if await final_check.count() > 0 and await final_check.first.is_visible():
-                print(f"   ⚠️ {year}: Load More still visible after loop! Running cleanup...")
-                for _ in range(50):
-                    try:
-                        await page.evaluate("document.querySelectorAll('[id^=\"bx-campaign\"], .bxc, .IL_BASE, [id=\"IL_INSEARCH\"], [id=\"d_IL_INSEARCH\"]').forEach(el => el.remove())")
-                        if await final_check.count() > 0 and await final_check.first.is_visible():
-                            try:
-                                await final_check.first.click(timeout=5000)
-                            except Exception:
-                                await page.evaluate("""
-                                    () => {
-                                        const btn = document.querySelector('.transfer-group-loadMore') 
-                                            || document.querySelector('.showmore_lnk')
-                                            || [...document.querySelectorAll('button')].find(b => b.textContent.includes('Load More'));
-                                        if (btn) btn.click();
-                                    }
-                                """)
-                            await asyncio.sleep(2.5)
-                        else:
-                            break
-                    except:
-                        continue
-                print(f"   ✅ {year}: Cleanup complete")
+            await page.evaluate(OVERLAY_CLEANUP_JS)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(2)
         except:
             pass
     else:
@@ -577,15 +631,11 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
         await asyncio.sleep(1)
     
     # ---------------------------------------------------------------
-    # STEP 3: Extract player profile links
+    # STEP 3: Extract player profile links (multiple selectors)
     # ---------------------------------------------------------------
     print(f"--- 3. Extracting {year} Profile Links ---")
     
-    # Collect from ALL selectors and combine — different portal years use different templates:
-    #   - 2025/2026: .rankings-page__name-link
-    #   - 2024 and earlier: li.transfer-player h3 a (no .rankings-page__name-link class)
     all_links = []
-    
     for selector in [
         ".rankings-page__name-link",
         "li.transfer-player h3 a",
@@ -603,7 +653,7 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
         except:
             pass
     
-    # Last resort if nothing matched above
+    # Last resort
     if len(all_links) == 0:
         all_links = await page.eval_on_selector_all(
             "a[href*='/player/']",
@@ -611,15 +661,14 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
         )
         print(f"   📎 broad fallback → {len(all_links)} links")
     
-    # Merge TransferPortalTop links FIRST (top ~247 with correct rankings)
-    # These go first so dict.fromkeys preserves them over positionranking duplicates
+    # Merge TransferPortalTop links FIRST (preserve priority)
     merged_links = []
     if top_links:
         merged_links.extend(top_links)
         print(f"   📎 {len(top_links)} links from TransferPortalTop (priority)")
     merged_links.extend(all_links)
     
-    # Normalize and deduplicate (dict.fromkeys preserves first occurrence order)
+    # Normalize and deduplicate
     unique_links = list(dict.fromkeys(
         normalize_player_url(l)
         for l in merged_links
@@ -642,7 +691,7 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     else:
         print(f"   ✅ {year}: Found {len(unique_links)} unique profiles")
     
-    # 🔧 FIX: Validate against expected total
+    # Validate coverage
     if expected_total and not TEST_MODE:
         coverage = len(unique_links) / expected_total * 100
         if coverage >= 95:
@@ -683,7 +732,6 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
 
 def generate_diagnostic_report(diagnostic_tracker, output_file="diagnostics_report.txt"):
     """Generate detailed diagnostic report"""
-    
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write("="*80 + "\n")
         f.write("🔍 DIAGNOSTIC REPORT\n")
@@ -697,7 +745,6 @@ def generate_diagnostic_report(diagnostic_tracker, output_file="diagnostics_repo
             f.write(f"📅 YEAR {year} ({total} players)\n")
             f.write(f"{'='*80}\n\n")
             
-            # Field completeness
             f.write("FIELD COMPLETENESS:\n")
             f.write("-" * 80 + "\n")
             
@@ -705,15 +752,12 @@ def generate_diagnostic_report(diagnostic_tracker, output_file="diagnostics_repo
                 filled = counts['filled']
                 na = counts['na']
                 pct = (filled / total * 100) if total > 0 else 0
-                
                 status = "✅" if pct >= 95 else ("⚠️" if pct >= 80 else "❌")
                 f.write(f"{status} {field:30} {filled:4d}/{total:4d} ({pct:5.1f}%)\n")
             
-            # Problem samples
             if year_data['problem_samples']:
                 f.write(f"\n🔴 PROBLEMATIC PLAYERS (saved {len(year_data['problem_samples'])} samples):\n")
                 f.write("-" * 80 + "\n")
-                
                 for sample in year_data['problem_samples']:
                     f.write(f"\nPlayer: {sample['player']} (ID: {sample['id']})\n")
                     f.write(f"URL: {sample['url']}\n")
@@ -728,7 +772,6 @@ def generate_diagnostic_report(diagnostic_tracker, output_file="diagnostics_repo
             year_data = diagnostic_tracker['by_year'][year]
             total = year_data['total']
             problem_count = len(year_data['problem_samples'])
-            
             status = "✅" if problem_count == 0 else ("⚠️" if problem_count < 5 else "❌")
             f.write(f"{status} {year}: {total} players scraped, {problem_count} problem samples saved\n")
     
@@ -758,7 +801,6 @@ async def main():
             all_results.extend(year_results)
             all_failed.extend(year_failed)
     
-    # Create final DataFrame
     if len(all_results) == 0:
         print("\n❌ No data scraped. Exiting.")
         return
@@ -771,7 +813,7 @@ async def main():
     ]
     df = df.reindex(columns=cols)
     
-    # Dedup: drop exact duplicate rows, then deduplicate by (247 ID, Transfer Year)
+    # Dedup
     before_dedup = len(df)
     df = df.drop_duplicates()
     df = df.drop_duplicates(subset=['247 ID', 'Transfer Year'], keep='first')
@@ -788,7 +830,6 @@ async def main():
     print(f"📁 Saved to: {output_filename}")
     print("="*80)
     
-    # Show breakdown by year
     if 'Transfer Year' in df.columns:
         year_counts = df['Transfer Year'].value_counts().sort_index(ascending=False)
         print("\n📅 Players by Transfer Year:")
@@ -801,7 +842,6 @@ async def main():
         pd.DataFrame(all_failed).to_csv(failed_file, index=False)
         print(f"   Failed URLs saved to: {failed_file}")
     
-    # Generate diagnostic report
     if DIAGNOSTICS_MODE and diagnostic_tracker['by_year']:
         generate_diagnostic_report(diagnostic_tracker)
 
