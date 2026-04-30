@@ -1,3 +1,14 @@
+"""
+247Sports Transfer Portal Scraper — multi-method, year-aware.
+
+Year routing:
+  - 2023-2026:  positionKey probe via /TransferPortalTop/?positionKey=N
+  - 2022:       team crawl via /transferteamrankings/ → per-team transfer pages
+  - 2021:       team crawl via /compositeteamrankings/ → per-team Transfers section
+
+User can override per-run with YEAR_RANGE env var. The downstream profile
+scraping/parsing/dedup pipeline is identical regardless of method.
+"""
 import asyncio
 import random
 import pandas as pd
@@ -8,43 +19,57 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from fake_useragent import UserAgent
 
-# --- CONFIGURATION ---
-# Position-filtered URL — shows ALL players in a single position with no Load More needed
+# --- URL TEMPLATES ---
 POSITION_URL_TEMPLATE = "https://247sports.com/season/{year}-football/TransferPortalTop/?positionKey={key}"
-# Main page — used to discover the available position keys for that year
 TOP_URL_TEMPLATE = "https://247sports.com/season/{year}-football/TransferPortalTop/"
+TRANSFER_TEAM_RANKINGS_URL = "https://247sports.com/season/{year}-football/transferteamrankings/"
+COMPOSITE_TEAM_RANKINGS_URL = "https://247sports.com/season/{year}-football/compositeteamrankings/"
 
-# ⭐ YEARS TO SCRAPE
+# --- YEAR ROUTING ---
+# Years that use positionKey probing (works on modern transfer portal layout)
+POSITIONKEY_YEARS = {2023, 2024, 2025, 2026}
+# Years that use the dedicated transfer-team-rankings index
+TRANSFER_TEAM_RANKINGS_YEARS = {2022}
+# Years that use the composite-rankings index + per-team Transfers section
+COMPOSITE_RANKINGS_YEARS = {2021}
+
+# --- YEAR INPUT PARSING ---
 YEAR_RANGE = os.getenv('YEAR_RANGE', '2024-2026')
-if YEAR_RANGE == '2021-2023':
-    YEARS = [2023, 2022, 2021]
-elif YEAR_RANGE == '2024-2026':
-    YEARS = [2026, 2025, 2024]
-elif YEAR_RANGE == 'all':
-    YEARS = [2026, 2025, 2024, 2023, 2022, 2021]
-elif YEAR_RANGE in ['2021', '2022', '2023', '2024', '2025', '2026']:
-    YEARS = [int(YEAR_RANGE)]
-else:
-    YEARS = [2026, 2025, 2024]
+
+def parse_year_input(raw):
+    """Accept '2024', '2024-2026', '2021,2022', 'all', etc."""
+    raw = (raw or '').strip()
+    if raw == 'all':
+        return [2026, 2025, 2024, 2023, 2022, 2021]
+    # Comma-separated
+    if ',' in raw:
+        return sorted({int(y.strip()) for y in raw.split(',') if y.strip().isdigit()}, reverse=True)
+    # Range like 2024-2026
+    if '-' in raw:
+        try:
+            lo, hi = [int(x) for x in raw.split('-')]
+            return list(range(hi, lo - 1, -1))
+        except ValueError:
+            pass
+    # Single year
+    if raw.isdigit():
+        return [int(raw)]
+    # Default
+    return [2026, 2025, 2024]
+
+YEARS = parse_year_input(YEAR_RANGE)
 
 CONCURRENCY_LIMIT = 4
 MAX_RETRIES = 2
 
-# ⭐ TEST MODE
 TEST_MODE = os.getenv('TEST_MODE', 'true').lower() == 'true'
 TEST_LIMIT = 50
 
 MODE_LABEL = "TEST" if TEST_MODE else "FULL"
 OUTPUT_FILE = f"transfer_portal_{min(YEARS)}-{max(YEARS)}_{MODE_LABEL}_{datetime.now().strftime('%Y%m%d')}.csv"
 
-# ⭐ DIAGNOSTICS
 DIAGNOSTICS_MODE = True
 MAX_DIAGNOSTIC_SAMPLES = 5
-
-# ⭐ Fallback position keys to brute-force if dynamic discovery fails.
-# Based on observed 247 conventions — covers a wide range so we don't miss any.
-# Known: 25=S, 59=LB. Others probed defensively.
-FALLBACK_POSITION_KEYS = list(range(1, 100))
 
 # --- UTILS ---
 def clean_text(text):
@@ -64,6 +89,16 @@ def normalize_player_url(url):
     if not url.endswith('/'):
         url += '/'
     return url
+
+def absolutize(href):
+    """247 sometimes returns absolute URLs in hrefs. Detect and don't double-prefix."""
+    if not href:
+        return None
+    if href.startswith('http://') or href.startswith('https://'):
+        return href
+    if href.startswith('/'):
+        return f"https://247sports.com{href}"
+    return None
 
 async def random_delay():
     await asyncio.sleep(random.uniform(0.3, 0.5))
@@ -295,39 +330,25 @@ def track_diagnostics(data, html, year, tracker):
                 'missing_fields': missing_fields, 'html_file': filename
             })
 
-# --- POSITION KEY DISCOVERY ---
-async def discover_position_keys(page, year):
-    """
-    NOT actually using the dropdown — that filter is UI-only and capped.
-    Instead, probe positionKey URLs 1-99 in parallel and keep the ones that
-    return at least 5 player links. Empty ones fail fast and are discarded.
-    
-    Returns list of (key, label) tuples. Label is empty since we don't extract
-    position names — but it doesn't matter, we just need the keys.
-    """
+# =============================================================================
+# METHOD A: positionKey probe (used for 2023-2026)
+# =============================================================================
+
+async def discover_position_keys(context, year):
+    """Probe positionKey 1-99 in parallel, keep keys that return >=3 player links."""
     print(f"   🔍 {year}: Probing positionKey URLs 1-99 in parallel...")
-    
-    # Use the same browser context for parallel probing
-    context = page.context
-    
-    # Known-confirmed keys (verified from user reports)
     KNOWN_KEYS = {14: 'WR', 25: 'S', 59: 'LB'}
-    
     valid_keys = []
     
     async def probe(key):
-        """Probe a single positionKey URL. Return (key, link_count) or None."""
         probe_page = await context.new_page()
         try:
             url = POSITION_URL_TEMPLATE.format(year=year, key=key)
             await probe_page.goto(url, timeout=30000, wait_until="domcontentloaded")
             await asyncio.sleep(1)
-            
-            # Count player links — fast, no scrolling
             count = await probe_page.evaluate("""
                 () => document.querySelectorAll('a[href*="/player/"]').length
             """)
-            
             await probe_page.close()
             return (key, count) if count >= 3 else None
         except Exception:
@@ -337,10 +358,8 @@ async def discover_position_keys(page, year):
                 pass
             return None
     
-    # Run probes in batches of 8 in parallel (be polite to 247)
-    keys_to_probe = list(range(1, 100))
     BATCH_SIZE = 8
-    
+    keys_to_probe = list(range(1, 100))
     for i in range(0, len(keys_to_probe), BATCH_SIZE):
         batch = keys_to_probe[i:i+BATCH_SIZE]
         results = await asyncio.gather(*[probe(k) for k in batch])
@@ -355,16 +374,11 @@ async def discover_position_keys(page, year):
     return valid_keys
 
 async def collect_links_from_position_page(page, year, position_key, label):
-    """Visit a positionKey-filtered page and extract all player profile links.
-    These pages show the FULL list per position with no Load More needed."""
     url = POSITION_URL_TEMPLATE.format(year=year, key=position_key)
     try:
         await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-        # Brief wait for any client-side rendering
         await asyncio.sleep(2)
-        
-        # Check if there's a Load More — if there is, click it once to be safe
-        # (most position pages don't have one, but just in case)
+        # Position pages don't paginate in the broken way the main list does — try a click in case
         try:
             for _ in range(5):
                 btn = page.locator(".transfer-group-loadMore, .showmore_lnk, text=Load More Players").first
@@ -378,43 +392,321 @@ async def collect_links_from_position_page(page, year, position_key, label):
                     break
         except:
             pass
-        
-        # Scroll once to trigger lazy-loading
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await asyncio.sleep(1)
         
         links = []
-        for selector in [
-            "li.transfer-player h3 a",
-            ".rankings-page__name-link",
-            "li.transfer-player a[href*='/player/']",
-            "a[href*='/player/']",
-        ]:
+        for selector in ["li.transfer-player h3 a", ".rankings-page__name-link",
+                         "li.transfer-player a[href*='/player/']", "a[href*='/player/']"]:
             try:
-                found = await page.eval_on_selector_all(
-                    selector,
-                    "elements => elements.map(e => e.href)"
-                )
+                found = await page.eval_on_selector_all(selector, "elements => elements.map(e => e.href)")
                 if found:
                     links.extend(found)
                     if len(links) > 0:
-                        break  # First selector that finds links is enough
+                        break
             except:
                 pass
-        
-        unique = list(dict.fromkeys(
-            normalize_player_url(l) for l in links if "247sports.com/player/" in l
-        ))
-        
+        unique = list(dict.fromkeys(normalize_player_url(l) for l in links if "247sports.com/player/" in l))
         if len(unique) > 0:
-            label_str = f" ({label})" if label else ""
-            print(f"      📎 positionKey={position_key}{label_str}: {len(unique)} players")
+            print(f"      📎 positionKey={position_key} ({label or '?'}): {len(unique)} players")
         return unique
     except Exception as e:
         print(f"      ⚠️ positionKey={position_key} failed: {e}")
         return []
 
-# --- SCRAPE YEAR ---
+async def collect_via_position_keys(context, year):
+    """Method A: discover keys, iterate each, aggregate."""
+    page = await context.new_page()
+    
+    # Cross-position top players (rank 1-247)
+    print(f"--- 1. Top players page for {year} ---")
+    top_links = []
+    try:
+        await page.goto(TOP_URL_TEMPLATE.format(year=year), timeout=60000, wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(1)
+        for selector in ["li.transfer-player h3 a", ".rankings-page__name-link", "a[href*='/player/']"]:
+            try:
+                found = await page.eval_on_selector_all(selector, "elements => elements.map(e => e.href)")
+                if found:
+                    top_links.extend(found)
+                    break
+            except:
+                pass
+        top_links = list(dict.fromkeys(normalize_player_url(l) for l in top_links if "247sports.com/player/" in l))
+        print(f"   ✅ {year}: Top page captured {len(top_links)} players")
+    except Exception as e:
+        print(f"   ⚠️ {year}: Top page fetch failed: {e}")
+    
+    # Discover & iterate positionKeys
+    print(f"--- 2. Discover & iterate positionKeys for {year} ---")
+    position_keys = await discover_position_keys(context, year)
+    
+    all_links = list(top_links)
+    for pos_key, label in position_keys:
+        links = await collect_links_from_position_page(page, year, pos_key, label)
+        all_links.extend(links)
+        await asyncio.sleep(0.5)
+    
+    await page.close()
+    return list(dict.fromkeys(all_links))
+
+# =============================================================================
+# METHOD B: /transferteamrankings/ crawl (used for 2022)
+# =============================================================================
+
+async def collect_via_transfer_team_rankings(context, year):
+    """Method B: load /transferteamrankings/, find each team's link, visit each
+    team's transfer-class page, extract player links."""
+    print(f"--- 1. Loading /transferteamrankings/ for {year} ---")
+    page = await context.new_page()
+    team_class_urls = []
+    try:
+        await page.goto(TRANSFER_TEAM_RANKINGS_URL.format(year=year),
+                        timeout=60000, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(2)
+        
+        # Extract team-class links. 247's team rankings page links each team to its 
+        # season-specific transfer page. Try multiple selector patterns.
+        raw_hrefs = await page.evaluate("""
+            () => {
+                const out = new Set();
+                // Anchor tags that look like team season pages
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const h = a.getAttribute('href') || '';
+                    if (h.includes('/college/') && h.includes('/recruiting/') && h.includes('Transfers')) {
+                        out.add(h);
+                    } else if (h.includes('/college/') && h.includes('-football/') && h.includes('Transfers')) {
+                        out.add(h);
+                    }
+                });
+                // Fallback: any team link that includes the year
+                if (out.size < 30) {
+                    document.querySelectorAll('a[href*="/college/"]').forEach(a => {
+                        const h = a.getAttribute('href') || '';
+                        out.add(h);
+                    });
+                }
+                return [...out];
+            }
+        """)
+        
+        # Normalize and filter: keep only college team URLs
+        for h in raw_hrefs:
+            full = absolutize(h)
+            if full and '/college/' in full:
+                team_class_urls.append(full)
+        team_class_urls = list(dict.fromkeys(team_class_urls))
+        print(f"   ✅ {year}: Found {len(team_class_urls)} candidate team URLs")
+    except Exception as e:
+        print(f"   ⚠️ {year}: transferteamrankings fetch failed: {e}")
+    
+    await page.close()
+    
+    if not team_class_urls:
+        return []
+    
+    # Visit each team page and extract player links
+    print(f"--- 2. Visiting {len(team_class_urls)} team pages for {year} ---")
+    all_player_links = []
+    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    
+    async def fetch_team(team_url):
+        async with sem:
+            tp = await context.new_page()
+            try:
+                await tp.goto(team_url, timeout=60000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                await tp.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1)
+                
+                links = await tp.eval_on_selector_all(
+                    "a[href*='/player/']",
+                    "elements => elements.map(e => e.href)"
+                )
+                normalized = [normalize_player_url(l) for l in links if "247sports.com/player/" in l]
+                if normalized:
+                    print(f"      📎 {team_url[:70]}... → {len(set(normalized))} players")
+                await tp.close()
+                return normalized
+            except Exception as e:
+                try:
+                    await tp.close()
+                except:
+                    pass
+                return []
+    
+    results = await asyncio.gather(*[fetch_team(u) for u in team_class_urls])
+    for r in results:
+        all_player_links.extend(r)
+    
+    return list(dict.fromkeys(all_player_links))
+
+# =============================================================================
+# METHOD C: /compositeteamrankings/ crawl with Transfers section (used for 2021)
+# =============================================================================
+
+async def collect_via_composite_rankings(context, year):
+    """Method C: paginate /compositeteamrankings/, visit each team page, find
+    the 'Transfers' section, extract player profile links from inside it only."""
+    print(f"--- 1. Loading /compositeteamrankings/ for {year} (paginated) ---")
+    page = await context.new_page()
+    team_urls = []
+    
+    page_num = 1
+    while True:
+        list_url = COMPOSITE_TEAM_RANKINGS_URL.format(year=year)
+        if page_num > 1:
+            list_url = f"{list_url}?Page={page_num}"
+        try:
+            await page.goto(list_url, timeout=60000, wait_until="domcontentloaded")
+            await asyncio.sleep(3)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(1)
+            
+            # Extract team links
+            raw_hrefs = await page.evaluate("""
+                () => {
+                    const out = new Set();
+                    document.querySelectorAll('a[href*="/college/"]').forEach(a => {
+                        const h = a.getAttribute('href') || '';
+                        if (/\\/college\\/[^/]+\\/season\\/\\d+-football\\/recruiting\\/?/.test(h)) {
+                            out.add(h);
+                        }
+                    });
+                    // Fallback: any college link in the rankings table
+                    if (out.size < 10) {
+                        document.querySelectorAll('a[href*="/college/"]').forEach(a => {
+                            out.add(a.getAttribute('href') || '');
+                        });
+                    }
+                    return [...out];
+                }
+            """)
+            
+            new_urls_this_page = []
+            for h in raw_hrefs:
+                full = absolutize(h)
+                if full and '/college/' in full and full not in team_urls:
+                    team_urls.append(full)
+                    new_urls_this_page.append(full)
+            
+            print(f"   📄 Page {page_num}: +{len(new_urls_this_page)} new team URLs (total {len(team_urls)})")
+            
+            # Detect if there's a next-page link
+            has_next = await page.evaluate("""
+                () => {
+                    const next = document.querySelector('a[rel="next"], .next a, a.next');
+                    if (next && !next.classList.contains('disabled')) return true;
+                    // Numbered pagination
+                    const pageLinks = [...document.querySelectorAll('a, button')].filter(el => 
+                        /^\\d+$/.test((el.textContent || '').trim())
+                    );
+                    return pageLinks.length > 0;
+                }
+            """)
+            
+            if not has_next or len(new_urls_this_page) == 0:
+                break
+            page_num += 1
+            if page_num > 20:  # safety cap
+                print(f"   ⚠️ {year}: Page cap hit at {page_num}, stopping pagination")
+                break
+        except Exception as e:
+            print(f"   ⚠️ {year}: Page {page_num} fetch failed: {e}")
+            break
+    
+    await page.close()
+    print(f"   ✅ {year}: Collected {len(team_urls)} team URLs across {page_num} pages")
+    
+    if not team_urls:
+        return []
+    
+    # For each team, find the Transfers section and extract player links
+    print(f"--- 2. Visiting {len(team_urls)} team pages, scraping Transfers section ---")
+    all_player_links = []
+    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    
+    async def fetch_team_transfers(team_url):
+        async with sem:
+            tp = await context.new_page()
+            try:
+                await tp.goto(team_url, timeout=60000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                # Scroll to load lazy content
+                for _ in range(3):
+                    await tp.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(1)
+                
+                # Find the Transfers section by heading text. The page structure varies, 
+                # but the heading "Transfers" or "Transfers (N)" should be present.
+                links = await tp.evaluate("""
+                    () => {
+                        // Find any heading containing 'Transfers'
+                        const headings = [...document.querySelectorAll('h1, h2, h3, h4, h5, header, .section-title, .header')];
+                        for (const h of headings) {
+                            const txt = (h.textContent || '').trim();
+                            if (/^Transfers?\\s*\\(?\\d*\\)?\\s*$/i.test(txt) || /Transfers?\\s*\\(\\d+\\)/i.test(txt)) {
+                                // Find the nearest container with player links
+                                let container = h.closest('section, article, div, ul');
+                                while (container && container.querySelectorAll('a[href*="/player/"]').length === 0) {
+                                    container = container.parentElement;
+                                    if (!container || container === document.body) break;
+                                }
+                                if (container) {
+                                    return [...container.querySelectorAll('a[href*="/player/"]')].map(a => a.href);
+                                }
+                            }
+                        }
+                        return [];
+                    }
+                """)
+                
+                normalized = [normalize_player_url(l) for l in links if "247sports.com/player/" in l]
+                if normalized:
+                    print(f"      📎 {team_url[:70]}... → {len(set(normalized))} transfer players")
+                await tp.close()
+                return normalized
+            except Exception as e:
+                try:
+                    await tp.close()
+                except:
+                    pass
+                return []
+    
+    results = await asyncio.gather(*[fetch_team_transfers(u) for u in team_urls])
+    for r in results:
+        all_player_links.extend(r)
+    
+    return list(dict.fromkeys(all_player_links))
+
+# =============================================================================
+# YEAR ROUTING
+# =============================================================================
+
+async def collect_links_for_year(context, year):
+    """Route each year to the appropriate collection method."""
+    if year in POSITIONKEY_YEARS:
+        print(f"   🧭 {year}: routing to POSITIONKEY method")
+        return await collect_via_position_keys(context, year)
+    elif year in TRANSFER_TEAM_RANKINGS_YEARS:
+        print(f"   🧭 {year}: routing to TRANSFER_TEAM_RANKINGS method")
+        return await collect_via_transfer_team_rankings(context, year)
+    elif year in COMPOSITE_RANKINGS_YEARS:
+        print(f"   🧭 {year}: routing to COMPOSITE_RANKINGS method")
+        return await collect_via_composite_rankings(context, year)
+    else:
+        # Default — try positionKey
+        print(f"   🧭 {year}: no explicit route, defaulting to POSITIONKEY method")
+        return await collect_via_position_keys(context, year)
+
+# =============================================================================
+# SCRAPE YEAR
+# =============================================================================
+
 async def scrape_year(year, p, ua, diagnostic_tracker):
     print("\n" + "="*80)
     print(f"📅 SCRAPING YEAR: {year}")
@@ -423,71 +715,14 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     browser = await p.chromium.launch(headless=True)
     context = await browser.new_context(user_agent=ua.random, viewport={'width': 1920, 'height': 1080})
     
-    # Block ads/overlays
+    # Block ad/overlay scripts
     await context.route("**/*bouncex*", lambda route: route.abort())
     await context.route("**/*bounceexchange*", lambda route: route.abort())
     await context.route("**/*integralas*", lambda route: route.abort())
     await context.route("**/*IL_INSEARCH*", lambda route: route.abort())
     
-    page = await context.new_page()
-    
-    # ---------------------------------------------------------------
-    # STEP 1: Discover position keys from the year's main TransferPortalTop page
-    # ---------------------------------------------------------------
-    print(f"--- 1. Discover Position Keys for {year} ---")
-    position_keys = await discover_position_keys(page, year)
-    
-    # ---------------------------------------------------------------
-    # STEP 2: Capture top 247 from main page (no positionKey filter)
-    #         These are the cross-position top-ranked players
-    # ---------------------------------------------------------------
-    print(f"--- 2. Capture Top Players (no filter) for {year} ---")
-    top_links = []
-    try:
-        await page.goto(TOP_URL_TEMPLATE.format(year=year), timeout=60000, wait_until="domcontentloaded")
-        await asyncio.sleep(2)
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(1)
-        
-        for selector in ["li.transfer-player h3 a", ".rankings-page__name-link", "a[href*='/player/']"]:
-            try:
-                found = await page.eval_on_selector_all(
-                    selector, "elements => elements.map(e => e.href)"
-                )
-                if found:
-                    top_links.extend(found)
-                    break
-            except:
-                pass
-        
-        top_links = list(dict.fromkeys(
-            normalize_player_url(l) for l in top_links if "247sports.com/player/" in l
-        ))
-        print(f"   ✅ {year}: Top page captured {len(top_links)} players (cross-position top ranked)")
-    except Exception as e:
-        print(f"   ⚠️ {year}: Top page fetch failed: {e}")
-    
-    # ---------------------------------------------------------------
-    # STEP 3: Iterate each position via positionKey URLs
-    # ---------------------------------------------------------------
-    print(f"--- 3. Iterate Position-Filtered URLs for {year} ---")
-    all_links = list(top_links)  # Start with top players, add positions
-    valid_position_count = 0
-    
-    for pos_key, label in position_keys:
-        links = await collect_links_from_position_page(page, year, pos_key, label)
-        if links:
-            valid_position_count += 1
-            all_links.extend(links)
-        # Small delay between position pages to be polite
-        await asyncio.sleep(0.5)
-    
-    print(f"   ✅ {year}: {valid_position_count} valid position pages contributed players")
-    
-    # ---------------------------------------------------------------
-    # STEP 4: Deduplicate
-    # ---------------------------------------------------------------
-    unique_links = list(dict.fromkeys(all_links))
+    # Phase 1: collect player URLs using year-appropriate method
+    unique_links = await collect_links_for_year(context, year)
     
     if TEST_MODE:
         unique_links = unique_links[:TEST_LIMIT]
@@ -495,17 +730,13 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     else:
         print(f"   ✅ {year}: {len(unique_links)} unique player profiles to scrape")
     
-    await page.close()
-    
     if len(unique_links) == 0:
         print(f"   ⚠️ {year}: No links found")
         await browser.close()
         return [], []
     
-    # ---------------------------------------------------------------
-    # STEP 5: Scrape each profile
-    # ---------------------------------------------------------------
-    print(f"--- 5. Scraping {year} Profiles ---")
+    # Phase 2: scrape each profile
+    print(f"--- Scraping {year} Profiles ---")
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     failed_urls = []
     tasks = [scrape_profile(context, link, sem, failed_urls, year, diagnostic_tracker) for link in unique_links]
@@ -516,6 +747,10 @@ async def scrape_year(year, p, ua, diagnostic_tracker):
     
     await browser.close()
     return valid_results, failed_urls
+
+# =============================================================================
+# DIAGNOSTICS
+# =============================================================================
 
 def generate_diagnostic_report(diagnostic_tracker, output_file="diagnostics_report.txt"):
     with open(output_file, 'w', encoding='utf-8') as f:
@@ -546,15 +781,19 @@ def generate_diagnostic_report(diagnostic_tracker, output_file="diagnostics_repo
             f.write(f"{status} {year}: {total} players scraped, {problem_count} problem samples saved\n")
     print(f"\n📋 Diagnostic report saved to: {output_file}")
 
+# =============================================================================
+# MAIN
+# =============================================================================
+
 async def main():
     ua = UserAgent()
     print("="*80)
     if TEST_MODE:
         print(f"🧪 TEST MODE - Scraping {TEST_LIMIT} players per year")
     else:
-        print(f"🚀 FULL MODE - Scraping all players via positionKey iteration")
+        print(f"🚀 FULL MODE - Year-aware multi-method scraping")
     print(f"📅 Years to scrape: {', '.join(map(str, YEARS))}")
-    print(f"📅 Year range setting: {YEAR_RANGE}")
+    print(f"📅 Year input: {YEAR_RANGE}")
     if DIAGNOSTICS_MODE:
         print(f"🔍 DIAGNOSTICS MODE: Enabled")
     print("="*80)
@@ -581,12 +820,11 @@ async def main():
     ]
     df = df.reindex(columns=cols)
     
-    before_dedup = len(df)
+    before = len(df)
     df = df.drop_duplicates()
     df = df.drop_duplicates(subset=['247 ID', 'Transfer Year'], keep='first')
-    after_dedup = len(df)
-    if before_dedup != after_dedup:
-        print(f"   🧹 Removed {before_dedup - after_dedup} duplicate rows ({before_dedup} → {after_dedup})")
+    if before != len(df):
+        print(f"   🧹 Removed {before - len(df)} duplicate rows ({before} → {len(df)})")
     
     df.to_csv(OUTPUT_FILE, index=False)
     
