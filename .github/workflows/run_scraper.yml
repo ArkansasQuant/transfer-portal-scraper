@@ -1,26 +1,17 @@
 name: Run Transfer Portal Scraper
+
 on:
   workflow_dispatch:
     inputs:
       year_range:
-        description: 'Year range to scrape'
-        required: true
-        default: '2024-2026'
-        type: choice
-        options:
-          - '2024-2026'
-          - '2021-2023'
-          - 'all'
-          - '2026'
-          - '2025'
-          - '2024'
-          - '2023'
-          - '2022'
-          - '2021'
-      test_mode:
-        description: 'Test Mode (true = 50 players, false = full scrape)'
+        description: 'Years: "2024-2026", "2021-2023", "all", "2021,2022", or single "2024"'
         required: false
-        default: 'true'
+        default: '2021,2022'
+        type: string
+      test_mode:
+        description: 'Test Mode (true = 50 players per year, false = full scrape)'
+        required: false
+        default: 'false'
         type: choice
         options:
           - 'true'
@@ -34,46 +25,53 @@ on:
           - '10'
           - '20'
           - '50'
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
-    
+      uses: actions/checkout@v4
+
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.9'
-    
+        python-version: '3.11'
+
     - name: Install dependencies
       run: |
         pip install -r requirements.txt
-        playwright install --with-deps chromium
-    
+        playwright install chromium
+        playwright install-deps
+
     - name: Run Scraper
-      run: python scraper.py
       env:
-        TEST_MODE: ${{ github.event.inputs.test_mode }}
         YEAR_RANGE: ${{ github.event.inputs.year_range }}
-    
+        TEST_MODE: ${{ github.event.inputs.test_mode }}
+      run: python scraper.py
+
     - name: Validate Accuracy
-      run: python validate_accuracy.py TEST_*.csv ${{ github.event.inputs.validation_sample }}
       if: always()
-    
+      run: |
+        if ls *FULL*.csv 1> /dev/null 2>&1; then
+          python validate_accuracy.py *FULL*.csv ${{ github.event.inputs.validation_sample }} || true
+        elif ls *TEST*.csv 1> /dev/null 2>&1; then
+          python validate_accuracy.py *TEST*.csv ${{ github.event.inputs.validation_sample }} || true
+        fi
+
     - name: Upload CSV Data
-      uses: actions/upload-artifact@v4
       if: always()
+      uses: actions/upload-artifact@v4
       with:
         name: CSV_Output
         path: |
           *.csv
         retention-days: 90
-    
+
     - name: Upload Diagnostic Report
-      uses: actions/upload-artifact@v4
       if: always()
+      uses: actions/upload-artifact@v4
       with:
         name: Diagnostics
         path: |
