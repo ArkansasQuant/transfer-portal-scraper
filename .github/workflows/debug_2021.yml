@@ -1,0 +1,21 @@
+name: Debug 2021 Page Structure
+on: workflow_dispatch
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps
+      - run: python debug_2021.py 2>&1 | tee debug_output.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: debug_output
+          path: debug_output.txt
