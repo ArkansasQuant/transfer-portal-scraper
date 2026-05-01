@@ -1,0 +1,133 @@
+"""
+Diagnostic: what does the 2021 composite team-rankings index look like, and what
+does ONE team's page look like? Run this once. It tells us the actual selectors
+we need for Method C.
+"""
+import asyncio
+from playwright.async_api import async_playwright
+
+COMPOSITE_URL = "https://247sports.com/season/2021-football/compositeteamrankings/"
+
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
+        # Block ads/overlays
+        for pat in ["**/*bouncex*", "**/*bounceexchange*", "**/*integralas*", "**/*IL_INSEARCH*"]:
+            await context.route(pat, lambda route: route.abort())
+        page = await context.new_page()
+        
+        print("=" * 80)
+        print(f"STEP 1: Loading {COMPOSITE_URL}")
+        print("=" * 80)
+        await page.goto(COMPOSITE_URL, timeout=60000, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        
+        # Print the FIRST 10 college links found on the page, with surrounding context
+        team_urls_info = await page.evaluate("""
+            () => {
+                const links = [...document.querySelectorAll('a[href*="/college/"]')];
+                return links.slice(0, 30).map(a => ({
+                    href: a.href,
+                    text: (a.textContent || '').trim().slice(0, 60),
+                    parent_classes: a.parentElement?.className?.slice(0, 80) || '',
+                    parent_tag: a.parentElement?.tagName || ''
+                }));
+            }
+        """)
+        
+        print(f"\nFirst 30 /college/ links found:")
+        for i, info in enumerate(team_urls_info):
+            print(f"  {i+1}. [{info['parent_tag']} class='{info['parent_classes']}']")
+            print(f"     href: {info['href']}")
+            print(f"     text: {info['text']!r}")
+        
+        # Pick one team URL that looks like a team page (not navigation)
+        sample_url = None
+        for info in team_urls_info:
+            href = info['href']
+            # Heuristic: real team pages often include /season/ or have a team-name slug
+            if '/season/' in href and '2021' in href and 'compositeteamrankings' not in href:
+                sample_url = href
+                break
+        
+        if not sample_url:
+            # Fallback: any /college/ link that's not the rankings page itself
+            for info in team_urls_info:
+                href = info['href']
+                if 'compositeteamrankings' not in href and 'transferteamrankings' not in href:
+                    sample_url = href
+                    break
+        
+        if not sample_url:
+            print("\n❌ Couldn't find a sample team URL. Exiting.")
+            await browser.close()
+            return
+        
+        print("\n" + "=" * 80)
+        print(f"STEP 2: Inspecting one team page: {sample_url}")
+        print("=" * 80)
+        
+        team_page = await context.new_page()
+        await team_page.goto(sample_url, timeout=60000, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        # Scroll a bit to trigger lazy content
+        for _ in range(4):
+            await team_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(1)
+        
+        # 1. Find anything with "transfer" text
+        transfer_mentions = await team_page.evaluate("""
+            () => {
+                const out = [];
+                const all = document.querySelectorAll('h1, h2, h3, h4, h5, h6, .section-title, header, .header, .title, [class*="transfer"], [class*="Transfer"]');
+                all.forEach(el => {
+                    const txt = (el.textContent || '').trim().slice(0, 100);
+                    if (txt && /transfer/i.test(txt)) {
+                        out.push({
+                            tag: el.tagName,
+                            classes: (el.className || '').slice(0, 100),
+                            text: txt,
+                            child_player_links: el.querySelectorAll('a[href*="/player/"]').length,
+                            parent_player_links: el.parentElement?.querySelectorAll('a[href*="/player/"]').length || 0,
+                        });
+                    }
+                });
+                return out;
+            }
+        """)
+        
+        print(f"\nElements containing 'transfer' text on team page:")
+        for mention in transfer_mentions:
+            print(f"  <{mention['tag']} class='{mention['classes']}'>")
+            print(f"    text: {mention['text']!r}")
+            print(f"    self contains {mention['child_player_links']} player links")
+            print(f"    parent contains {mention['parent_player_links']} player links")
+        
+        # 2. Total player links on the team page
+        total_player_links = await team_page.evaluate("""
+            () => document.querySelectorAll('a[href*="/player/"]').length
+        """)
+        print(f"\nTotal player links on team page: {total_player_links}")
+        
+        # 3. Show the headings hierarchy
+        all_headings = await team_page.evaluate("""
+            () => {
+                const out = [];
+                document.querySelectorAll('h1, h2, h3, h4, h5, .section-title, .title, header').forEach(el => {
+                    const txt = (el.textContent || '').trim().slice(0, 80);
+                    if (txt) {
+                        out.push({tag: el.tagName, classes: (el.className || '').slice(0, 60), text: txt});
+                    }
+                });
+                return out.slice(0, 60);
+            }
+        """)
+        print(f"\nFirst 60 headings on team page (look for the Transfers heading):")
+        for h in all_headings:
+            print(f"  <{h['tag']} class='{h['classes']}'> {h['text']!r}")
+        
+        await browser.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
