@@ -47,9 +47,9 @@ jobs:
 
     - name: Run Scraper
       env:
-        YEAR_RANGE: ${{ github.event.inputs.year_range }}
-        TEST_MODE: ${{ github.event.inputs.test_mode }}
-      run: python scraper.py
+        DRY_RUN: 'true'
+        CYCLE: '2027'
+      run: python live_portal.py
 
     - name: Validate Accuracy
       if: always()
