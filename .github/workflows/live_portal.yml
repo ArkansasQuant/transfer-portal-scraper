@@ -1,0 +1,70 @@
+name: 247 live portal -> cfbquant /portal
+
+# The current cycle's transfer portal entrants, from 247's "Latest" list, into cfbquant's /portal tables
+# (Nelson, 2026-11-25). live_portal.py scrapes the list in headless Chromium and posts it to the ingest RPC
+# (public.aq_247_portal_ingest); pg_cron `aq-247-portal-apply` mirrors it into /portal within 10 minutes.
+#
+# Cadence: daily 05:40 ET (06:40 in summer time) Feb-Nov, every 3 hours Dec 1-Jan 31 (the run-up to the
+# January window and the window). This repo is public, so its Actions minutes are free.
+#
+# Needs one repository secret: CFBQ_PORTAL_INGEST_TOKEN (the value stored in Supabase Vault as
+# cfbq_portal_ingest_token). The Supabase URL and publishable key below are public; the site ships them.
+
+on:
+  schedule:
+    - cron: '40 10 * 2-11 *'
+    - cron: '40 */3 * 12,1 *'
+  workflow_dispatch:
+    inputs:
+      cycle:
+        description: 'Portal cycle (the season the move is for); blank = the next January window'
+        required: false
+        default: ''
+      dry_run:
+        description: 'true = scrape and print only, post nothing'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-portal
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        run: |
+          pip install playwright requests
+          python -m playwright install --with-deps chromium
+
+      - name: Scrape 247 and post to cfbquant
+        env:
+          CYCLE: ${{ github.event.inputs.cycle }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          CFBQ_SUPABASE_URL: https://iyrsrlrrrjnzsxguciph.supabase.co
+          CFBQ_SUPABASE_KEY: sb_publishable_CxMVC4WFwOyrV_hRVzFyyw_gbj4a518
+          CFBQ_PORTAL_INGEST_TOKEN: ${{ secrets.CFBQ_PORTAL_INGEST_TOKEN }}
+        run: python live_portal.py
+
+      - name: Keep a dry run's rows (1 day)
+        if: ${{ always() && github.event.inputs.dry_run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-portal-dry-run
+          path: live_*.json
+          retention-days: 1
